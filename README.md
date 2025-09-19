@@ -25,3 +25,6 @@ python run_eval_rolling_3csv.py \
   --out artifacts/rolling_eval \
   --device cuda:0 \
   --save-csv
+
+#
+집거 그냥 옮기는 중 깃테스트
