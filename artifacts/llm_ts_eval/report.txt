@@ -1,0 +1,7 @@
+backbone     : llm_ts
+device/dtype : cuda/float32
+csvs         : data/varA.csv, data/varB.csv, data/varC.csv
+N, T         : 4200, 220
+context_len  : 219
+mean MSE     : 0.655927
+mean MAE     : 0.689110

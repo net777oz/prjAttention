@@ -1,30 +1,33 @@
-# TTM Flow Demo (compact 4-module version)
+# AttentionProject - LLM-TS Backbone
 
-## Install
-```bash
-python -m venv .venv && source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-
-# Rolling Evaluation with 3 CSV Inputs
-
-이 저장소는 **세 가지 시계열 CSV 데이터**(`--csv1`, `--csv2`, `--csv3`)를 입력으로 받아,  
-IBM Granite Time Series Transformer 모델을 이용해 순차 예측(rolling evaluation)을 수행하는 스크립트 예제입니다.  
+시계열 Transformer (llm_ts) 백본을 이용한 **제로부터 학습 및 평가** 파이프라인.
 
 ---
 
-## 🚀 실행 방법
+## 1. 학습 (제로부터 시작)
 
-### 1. 기본 명령
+3변량 CSV (`varA.csv`, `varB.csv`, `varC.csv`)를 입력으로  
+`context_len=32`, `epochs=500` 조건으로 학습:
+
 ```bash
-python run_eval_rolling_3csv.py \
-  --csv1 data/varA.csv \
-  --csv2 data/varB.csv \
-  --csv3 data/varC.csv \
-  --model-id ibm-granite/granite-timeseries-ttm-r2 \
-  --ckpt checkpoints/ttm_r2_ft1step_best.pt \
-  --out artifacts/rolling_eval \
-  --device cuda:0 \
-  --save-csv
+python run_finetune_1step.py \
+  --backbone llm_ts \
+  --context-len 32 \
+  --csv1 data/varA.csv --csv2 data/varB.csv --csv3 data/varC.csv \
+  --out artifacts/llm_ts_e500_l32 \
+  --epochs 500 \
+  --lr 2e-4 \
+  --weight-decay 0.01 \
+  --plot-samples 3 \
+  --log-every 5
 
-#
-집거 그냥 옮기는 중 깃테스트
+## 1. 학습 후 평가 (체크포인트 사용)
+
+python run_eval_rolling_3csv.py \
+  --backbone llm_ts \
+  --context-len 32 \
+  --csv1 data/varA.csv --csv2 data/varB.csv --csv3 data/varC.csv \
+  --ckpt artifacts/llm_ts_e500_l32/model.pt \
+  --out artifacts/llm_ts_e500_l32_eval \
+  --plot-samples 5 \
+  --save-csv
