@@ -1,0 +1,3 @@
+N=4200,T=220,context=32
+mean MSE=1.226021
+mean MAE=0.905157
