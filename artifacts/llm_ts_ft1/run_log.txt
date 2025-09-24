@@ -1,7 +1,0 @@
-backbone     : llm_ts
-device/dtype : cuda/float32
-N,C,T        : 4200,3,220
-context_len  : 200
-epochs/lr/wd : 3/0.0002/0.01
-seed         : 777
-params       : 4740867
