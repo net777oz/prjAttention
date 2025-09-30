@@ -1,7 +1,7 @@
 import numpy as np
 
-src_csv = "data/SDa.csv"
-dst_csv = "data/SD0a.csv"
+src_csv = "data/LPa.csv"
+dst_csv = "data/LP0a.csv"
 
 # BOM 제거 안전하게 utf-8-sig로 읽기
 arr = np.loadtxt(src_csv, delimiter=",", dtype=np.float32, encoding="utf-8-sig")

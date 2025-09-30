@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-LLM-스타일 시계열 Transformer (llm_ts) 통합 스크립트 — 회귀/이진분류 겸용
+LLM-스타일 시계열 Transformer (llm_ts) 통합 스크립트 — 단일 CSV(단일 채널) 전용
 - 모드: --mode {train, finetune, infer}
-- CSV(헤더/인덱스 없음): 행=아이템(N), 열=시간(T)
-- 다변량 입력: --csv1/2/3 또는 --csv-list (단일 CSV는 --csv)
+- CSV(헤더/인덱스 없음): 행=아이템(N), 열=시간(T), 채널=1 고정
 - 롤링윈도우(teacher-forcing) 유지
 - 분류 모드: α*BCEWithLogits + (1-α)*(1-SoftF1), pos_weight 전역/배치/없음
 - 임계값: 검증 윈도우에서 F1 최대가 되는 τ 선택(기본 0.5 폴백)
@@ -21,7 +20,7 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from torch.utils.data import TensorDataset, DataLoader, Subset
 from torch.cuda.amp import GradScaler
-from torch import amp  # ✅ NEW: use torch.amp.autocast
+from torch import amp  # ✅ use torch.amp.autocast
 from ttm_flow.model import load_model_and_cfg
 
 # ===== Console UI (rich optional) =====
@@ -54,26 +53,18 @@ def read_csv_no_header(path: str) -> np.ndarray:
 def to_tensor(x: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(x).to(dtype=torch.float32).contiguous()
 
-def stack_multivar(csv_paths) -> torch.Tensor:
-    mats = [to_tensor(read_csv_no_header(p)) for p in csv_paths]
-    shapes = [tuple(m.shape) for m in mats]
-    if len(set(shapes)) != 1:
-        raise ValueError(f"All CSV shapes must match. got={shapes}")
-    return torch.stack(mats, dim=1)  # [N,C,T]
-
-def parse_csvs(args) -> torch.Tensor:
-    if args.csv_list:
-        paths = [p.strip() for p in args.csv_list.split(",") if p.strip()]
-        if len(paths) < 1: raise SystemExit("--csv-list must have at least 1 path")
-        return stack_multivar(paths)
-    if args.csv1 and args.csv2 and args.csv3:
-        return stack_multivar([args.csv1, args.csv2, args.csv3])
-    if args.csv:
-        M = to_tensor(read_csv_no_header(args.csv))  # [N,T]
-        N, T = M.shape
-        # 단일 CSV가 N행이고 3채널이 3행 주기로 섞여있는 특수케이스 자동 보정
-        return torch.stack([M[0::3], M[1::3], M[2::3]], dim=1) if (N>=3 and N%3==0) else M.unsqueeze(1)
-    raise SystemExit("CSV 입력 필요: --csv-list 또는 --csv1/--csv2/--csv3 또는 --csv")
+def parse_csv_single(args) -> torch.Tensor:
+    """
+    단일 CSV만 허용.
+    입력: CSV [N,T] (행=아이템, 열=시간)
+    출력: 텐서 [N,1,T]
+    """
+    if not args.csv:
+        raise SystemExit("CSV 입력 필요: --csv <path_to_single_csv>")
+    M = to_tensor(read_csv_no_header(args.csv))  # [N,T]
+    if M.ndim != 2:
+        raise SystemExit(f"--csv는 2차원 [N,T] 형태여야 합니다. got shape={tuple(M.shape)}")
+    return M.unsqueeze(1)  # [N,1,T]
 
 def make_run_dir(args) -> str:
     base = "artifacts"
@@ -91,19 +82,19 @@ def make_run_dir(args) -> str:
 # -----------------------------
 def build_windows_dataset(X: torch.Tensor, L: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """
-    X: [N,C,T] -> Xw:[N*W,C,L], Yw:[N*W,C], groups:[N*W], W=T-L
+    X: [N,1,T] -> Xw:[N*W,1,L], Yw:[N*W,1], groups:[N*W], W=T-L
     groups: 원본 시계열 index → group-aware split에 사용
     반환의 마지막 값 W는 아이템당 윈도우 개수
     """
     N, C, T = X.shape
     L = max(1, min(L, T-1))
     W = T - L
-    Xw_full = X.unfold(dimension=2, size=L, step=1)   # [N,C,W+1,L]
-    Xw = Xw_full[:, :, :W, :]                         # [N,C,W,L]
-    Yw = X[:, :, L:]                                  # [N,C,W]
-    Xw = Xw.permute(0,2,1,3).contiguous().view(N*W, C, L)
-    Yw = Yw.permute(0,2,1).contiguous().view(N*W, C)
-    groups = torch.arange(N).repeat_interleave(W)     # [N*W]
+    Xw_full = X.unfold(dimension=2, size=L, step=1)   # [N,1,W+1,L]
+    Xw = Xw_full[:, :, :W, :]                         # [N,1,W,L]
+    Yw = X[:, :, L:]                                  # [N,1,W]
+    Xw = Xw.permute(0,2,1,3).contiguous().view(N*W, C, L)  # [N*W,1,L]
+    Yw = Yw.permute(0,2,1).contiguous().view(N*W, C)       # [N*W,1]
+    groups = torch.arange(N).repeat_interleave(W)          # [N*W]
     return Xw, Yw, groups, W
 
 # -----------------------------
@@ -177,7 +168,6 @@ def metrics_from_probs(y_true: torch.Tensor, y_prob: torch.Tensor, threshold: fl
 
 @torch.no_grad()
 def find_best_threshold_for_f1(y_true: torch.Tensor, y_prob: torch.Tensor, step: float = 0.001):
-    # 둘 다 1D로 정렬
     y_true = y_true.float().view(-1)
     y_prob = y_prob.float().view(-1)
     taus = np.arange(0.0, 1.0 + 1e-12, step, dtype=np.float32)
@@ -284,15 +274,15 @@ def eval_model(model, X: torch.Tensor, L: int, desc="eval", heartbeat_sec=5,
         return None, None, ytrue, yprob
 
 # -----------------------------
-# 플롯 유틸
+# 플롯 유틸 (단일 채널)
 # -----------------------------
 def plot_samples(model, X: torch.Tensor, L: int, outdir: str, k: int = 3, prefix: str = "after"):
     ensure_outdir(outdir); plots_dir = os.path.join(outdir, "plots"); ensure_outdir(plots_dir)
     model.eval(); dev = next(model.parameters()).device
     N, C, T = X.shape
-    colors = ['tab:blue','tab:orange','tab:green','tab:red','tab:purple','tab:brown']
     for i in range(min(k, N)):
-        row = X[i]; preds = torch.full((C, T), float("nan"))
+        row = X[i]                 # [1,T]
+        preds = torch.full((C, T), float("nan"))
         Lc = max(1, min(L, T-1))
         Xw, _, _, _ = build_windows_dataset(row.unsqueeze(0), Lc)
         with torch.no_grad():
@@ -300,13 +290,11 @@ def plot_samples(model, X: torch.Tensor, L: int, outdir: str, k: int = 3, prefix
         preds[:, Lc:] = pred.T
         x_np = row.numpy(); p_np = preds.numpy()
         plt.figure(figsize=(12,4))
-        for c in range(C):
-            col = colors[c % len(colors)]
-            plt.plot(range(T), x_np[c], color=col, linewidth=1.2, label=f"ch{c+1} true")
-            m = ~np.isnan(p_np[c])
-            if m.any():
-                plt.plot(np.arange(T)[m], p_np[c][m], color=col, ls="--", linewidth=1.2, label=f"ch{c+1} pred")
-        plt.legend(loc="upper right", fontsize=9, ncol=3)
+        plt.plot(range(T), x_np[0], linewidth=1.2, label=f"true")
+        m = ~np.isnan(p_np[0])
+        if m.any():
+            plt.plot(np.arange(T)[m], p_np[0][m], ls="--", linewidth=1.2, label=f"pred")
+        plt.legend(loc="upper right", fontsize=9)
         plt.title(f"row {i} (context={Lc})")
         plt.xlabel("time (col index)"); plt.ylabel("value")
         plt.tight_layout(); plt.savefig(os.path.join(plots_dir, f"{prefix}_row{i:04d}.png")); plt.close()
@@ -375,9 +363,13 @@ def plot_cls_curves(y_true: torch.Tensor, y_prob: torch.Tensor, tau: float, outd
 
     # 4) Probability histogram
     plt.figure(figsize=(10,4))
-    plt.hist(yp[yt==0], bins=50, alpha=0.7, label="y=0")
-    plt.hist(yp[yt==1], bins=50, alpha=0.7, label="y=1")
-    plt.axvline(tau, ls="--"); plt.legend(); plt.title("Probability Histogram")
+    bins = np.linspace(0.0, 1.0, 51)  # 0~1 구간을 동일폭 50개로 고정
+    plt.hist(yp[yt==0], bins=bins, alpha=0.6, label="y=0")
+    plt.hist(yp[yt==1], bins=bins, alpha=0.6, label="y=1")
+    plt.axvline(tau, ls="--")
+    plt.xlim(0, 1)
+    plt.legend()
+    plt.title("Probability Histogram (shared bins)")
     plt.tight_layout(); plt.savefig(os.path.join(plots_dir, f"{prefix}_prob_hist.png")); plt.close()
 
     # 5) Confusion @ τ
@@ -548,12 +540,8 @@ def make_splits(Xw_all: torch.Tensor, Yw_all: torch.Tensor, groups: torch.Tensor
 # -----------------------------
 def main():
     ap = argparse.ArgumentParser()
-    # 입력
-    ap.add_argument("--csv", type=str, default=None)
-    ap.add_argument("--csv1", type=str, default=None)
-    ap.add_argument("--csv2", type=str, default=None)
-    ap.add_argument("--csv3", type=str, default=None)
-    ap.add_argument("--csv-list", type=str, default=None, help='Comma list: "a.csv,b.csv,..."')
+    # 입력 (단일 CSV만)
+    ap.add_argument("--csv", type=str, required=True, help="단일 CSV 경로 (헤더/인덱스 없음, [N,T])")
 
     # 모드/작업/모델/학습/출력
     ap.add_argument("--mode", type=str, required=True, choices=["train","finetune","infer"])
@@ -585,7 +573,7 @@ def main():
     ap.add_argument("--compile", type=str, default="", help='torch.compile mode: "", "reduce-overhead", "max-autotune"')
     ap.add_argument("--eval-batch-size", type=int, default=4096)
 
-    # split 옵션 (NEW)
+    # split 옵션
     ap.add_argument("--split-mode", type=str, default="group",
                     choices=["group","item","time","window"],
                     help="데이터 분할 방식: group(기본, 누수방지), item(행), time(앞/뒤), window(랜덤, 누수 위험)")
@@ -597,9 +585,9 @@ def main():
     set_seed(args.seed)
     out_dir = make_run_dir(args)
 
-    # 데이터 로드
-    X = parse_csvs(args)   # [N,C,T]
-    N, C, T = X.shape
+    # 데이터 로드 (단일 채널)
+    X = parse_csv_single(args)   # [N,1,T]
+    N, C, T = X.shape  # C는 항상 1
 
     # context_len 보정
     if args.context_len >= T:
@@ -609,8 +597,8 @@ def main():
         print(f"[WARN] context_len({args.context_len}) < 1 → auto-set to 1", flush=True)
         args.context_len = 1
 
-    # 모델
-    model, _ = load_model_and_cfg(backbone=args.backbone, in_channels=C)
+    # 모델 (입력 채널 1로 고정)
+    model, _ = load_model_and_cfg(backbone=args.backbone, in_channels=1)
     model = model.to(device=args.device, dtype=torch.float32)
 
     # torch.compile
@@ -696,7 +684,7 @@ def main():
         else:  # ge
             Yw_all = (Yw_next >= args.bin_thr).float()
 
-    # split (NEW)
+    # split
     trn_idx, val_idx = make_splits(Xw_all, Yw_all, groups, N, T, args.context_len, W,
                                    args.split_mode, args.val_ratio, args.seed)
     print(f"[INFO] split={args.split_mode} train_windows={len(trn_idx)} val_windows={len(val_idx)}", flush=True)
@@ -736,7 +724,7 @@ def main():
             f.write(f"after  MSE {amse:.6f} MAE {amae:.6f}\n")
         plot_samples(model, X, args.context_len, out_dir, k=args.plot_samples, prefix="after")
     else:
-        # 검증 윈도우에서 τ 선택 (OOM 방지 배치 추론; ✅ xb/yb 차원 보존)
+        # 검증 윈도우에서 τ 선택 (OOM 방지 배치 추론)
         probs_chunks = []; yv_chunks = []
         dev = args.device
         with torch.no_grad():
@@ -776,4 +764,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

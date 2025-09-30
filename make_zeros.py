@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 
-src_csv = "data/SD0a.csv"
+src_csv = "data/LP0a.csv"
 
 # BOM 제거: utf-8-sig로 읽기
 with open(src_csv, "r", encoding="utf-8-sig") as f:
