@@ -1,25 +1,30 @@
 # -*- coding: utf-8 -*-
 """
 LLM-스타일 시계열 Transformer (llm_ts) 통합 스크립트 — 회귀/이진분류 겸용
-(요약)
-- 분류 손실: α*BCEWithLogits + (1-α)*(1-SoftF1), pos_weight 전역/배치/없음
-- τ: 검증 윈도우서 F1 최대화로 선택(기본 0.5 폴백)
-- 리포트/플롯: F1-τ, PR, ROC, 확률 히스토그램, Confusion, (NEW) Precision/Recall vs Threshold, 학습곡선
-- OOM 회피: 검증 배치 평가
-- 결과: artifacts/<out>/...
+- 모드: --mode {train, finetune, infer}
+- CSV(헤더/인덱스 없음): 행=아이템(N), 열=시간(T)
+- 다변량 입력: --csv1/2/3 또는 --csv-list (단일 CSV는 --csv)
+- 롤링윈도우(teacher-forcing) 유지
+- 분류 모드: α*BCEWithLogits + (1-α)*(1-SoftF1), pos_weight 전역/배치/없음
+- 임계값: 검증 윈도우에서 F1 최대가 되는 τ 선택(기본 0.5 폴백)
+- 리포트: Accuracy/Precision/Recall/F1(주), MSE/MAE(참고)
+- AMP(torch.amp.autocast), torch.compile, rich 표 UI, OOM-안전 eval 배치
+- NEW: --split-mode {group,item,time,window} (기본 group, 누수 방지)
 """
 
 import argparse, os, time, math
-from typing import Tuple, Optional, Dict, List
+from typing import Tuple, Optional, List
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-from torch.utils.data import TensorDataset, DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import TensorDataset, DataLoader, Subset
+from torch.cuda.amp import GradScaler
+from torch import amp  # ✅ NEW: use torch.amp.autocast
 from ttm_flow.model import load_model_and_cfg
 
+# ===== Console UI (rich optional) =====
 USE_RICH = False
 try:
     from rich.console import Console
@@ -29,9 +34,11 @@ try:
     USE_RICH = True
     console = Console()
 except Exception:
-    console = None
+    console = None  # fallback
 
-# ----------------------------- utils
+# -----------------------------
+# 유틸
+# -----------------------------
 def set_seed(seed: int = 777):
     import torch.backends.cudnn as cudnn
     np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
@@ -64,37 +71,51 @@ def parse_csvs(args) -> torch.Tensor:
     if args.csv:
         M = to_tensor(read_csv_no_header(args.csv))  # [N,T]
         N, T = M.shape
+        # 단일 CSV가 N행이고 3채널이 3행 주기로 섞여있는 특수케이스 자동 보정
         return torch.stack([M[0::3], M[1::3], M[2::3]], dim=1) if (N>=3 and N%3==0) else M.unsqueeze(1)
     raise SystemExit("CSV 입력 필요: --csv-list 또는 --csv1/--csv2/--csv3 또는 --csv")
 
 def make_run_dir(args) -> str:
     base = "artifacts"
-    slug = f"{args.mode}_{args.task}_ctx{args.context_len}_alpha{args.alpha:.2f}_pw{args.pos_weight}_{args.backbone}_seed{args.seed}"
-    run_name = args.out if args.out else slug
+    if args.out:
+        run_name = args.out
+    else:
+        slug = f"{args.mode}_{args.task}_ctx{args.context_len}_alpha{args.alpha:.2f}_pw{args.pos_weight}_{args.backbone}_seed{args.seed}_split{args.split_mode}"
+        run_name = slug
     out_dir = os.path.join(base, run_name)
     ensure_outdir(out_dir); ensure_outdir(os.path.join(out_dir, "plots"))
     return out_dir
 
-# ----------------------------- windows
-def build_windows_dataset(X: torch.Tensor, L: int) -> Tuple[torch.Tensor, torch.Tensor]:
+# -----------------------------
+# 롤링 윈도우 (groups 반환)
+# -----------------------------
+def build_windows_dataset(X: torch.Tensor, L: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """
+    X: [N,C,T] -> Xw:[N*W,C,L], Yw:[N*W,C], groups:[N*W], W=T-L
+    groups: 원본 시계열 index → group-aware split에 사용
+    반환의 마지막 값 W는 아이템당 윈도우 개수
+    """
     N, C, T = X.shape
     L = max(1, min(L, T-1))
     W = T - L
-    Xw_full = X.unfold(dimension=2, size=L, step=1)   # [N,C,T-L+1,L]
+    Xw_full = X.unfold(dimension=2, size=L, step=1)   # [N,C,W+1,L]
     Xw = Xw_full[:, :, :W, :]                         # [N,C,W,L]
     Yw = X[:, :, L:]                                  # [N,C,W]
-    Xw = Xw.permute(0,2,1,3).contiguous().view(N*W, C, L)  # [N*W,C,L]
-    Yw = Yw.permute(0,2,1).contiguous().view(N*W, C)       # [N*W,C]
-    return Xw, Yw
+    Xw = Xw.permute(0,2,1,3).contiguous().view(N*W, C, L)
+    Yw = Yw.permute(0,2,1).contiguous().view(N*W, C)
+    groups = torch.arange(N).repeat_interleave(W)     # [N*W]
+    return Xw, Yw, groups, W
 
-# ----------------------------- UI
+# -----------------------------
+# 콘솔 표 UI
+# -----------------------------
 def fmt_time(secs: Optional[float]) -> str:
     if secs is None or np.isnan(secs): return "-"
     m, s = divmod(int(secs), 60); h, m = divmod(m, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 def build_train_table(ep, epochs, bi, num_batches, done, total,
-                      loss_cur, loss_avg, lr, step_time, eta_sec, mem_mb, bs, amp, compiled):
+                      loss_cur, loss_avg, lr, step_time, eta_sec, mem_mb, bs, amp_on, compiled):
     t = Table(expand=True, show_header=False, pad_edge=False, box=None)
     left = Table(show_header=False, pad_edge=False, box=None)
     left.add_row("Epoch", f"{ep}/{epochs}")
@@ -108,7 +129,7 @@ def build_train_table(ep, epochs, bi, num_batches, done, total,
     mid.add_row("Step", f"{step_time:.2f}s")
     right = Table(show_header=False, pad_edge=False, box=None)
     right.add_row("BatchSize", str(bs))
-    right.add_row("AMP", "ON" if amp else "OFF")
+    right.add_row("AMP", "ON" if amp_on else "OFF")
     right.add_row("Compile", compiled or "OFF")
     right.add_row("GPU Mem", f"{int(mem_mb)}MB")
     t.add_row(left, mid, right)
@@ -122,9 +143,13 @@ def build_eval_table(phase: str, i:int, N:int, metric_name:str, metric_val:float
     t.add_row("ETA", fmt_time(eta_sec))
     return Panel(t, title="eval", border_style="magenta")
 
-# ----------------------------- classify helpers
+# -----------------------------
+# 분류용 손실/지표
+# -----------------------------
 class SoftF1Loss(torch.nn.Module):
-    def __init__(self, eps=1e-8): super().__init__(); self.eps = eps
+    """ 1 - SoftF1 (전체 배치·채널 합 기준) """
+    def __init__(self, eps=1e-8):
+        super().__init__(); self.eps = eps
     def forward(self, logits: torch.Tensor, targets: torch.Tensor):
         p = torch.sigmoid(logits); y = targets
         tp = (p * y).sum(); fp = (p * (1 - y)).sum(); fn = ((1 - p) * y).sum()
@@ -133,14 +158,16 @@ class SoftF1Loss(torch.nn.Module):
 
 @torch.no_grad()
 def metrics_from_probs(y_true: torch.Tensor, y_prob: torch.Tensor, threshold: float = 0.5, eps=1e-8):
-    y_true = y_true.float().view(-1); y_prob = y_prob.float().view(-1)
+    y_true = y_true.float().view(-1)
+    y_prob = y_prob.float().view(-1)
     y_pred = (y_prob >= threshold).float()
     tp = (y_pred * y_true).sum().item()
     tn = ((1 - y_pred) * (1 - y_true)).sum().item()
     fp = (y_pred * (1 - y_true)).sum().item()
     fn = ((1 - y_pred) * y_true).sum().item()
     acc = (tp + tn) / max(1, (tp + tn + fp + fn))
-    prec = tp / max(eps, (tp + fp)); rec = tp / max(eps, (tp + fn))
+    prec = tp / max(eps, (tp + fp))
+    rec = tp / max(eps, (tp + fn))
     f1 = 2 * prec * rec / max(eps, (prec + rec))
     mse = torch.mean((y_prob - y_true) ** 2).item()
     mae = torch.mean(torch.abs(y_prob - y_true)).item()
@@ -150,7 +177,9 @@ def metrics_from_probs(y_true: torch.Tensor, y_prob: torch.Tensor, threshold: fl
 
 @torch.no_grad()
 def find_best_threshold_for_f1(y_true: torch.Tensor, y_prob: torch.Tensor, step: float = 0.001):
-    y_true = y_true.float().view(-1); y_prob = y_prob.float().view(-1)
+    # 둘 다 1D로 정렬
+    y_true = y_true.float().view(-1)
+    y_prob = y_prob.float().view(-1)
     taus = np.arange(0.0, 1.0 + 1e-12, step, dtype=np.float32)
     best_tau, best_f1 = 0.5, -1.0
     for tau in taus:
@@ -158,16 +187,19 @@ def find_best_threshold_for_f1(y_true: torch.Tensor, y_prob: torch.Tensor, step:
         tp = (y_pred * y_true).sum().item()
         fp = (y_pred * (1 - y_true)).sum().item()
         fn = ((1 - y_pred) * y_true).sum().item()
-        prec = tp / (tp + fp + 1e-8); rec = tp / (tp + fn + 1e-8)
-        f1 = 2 * prec * rec / (prec + rec + 1e-8)
-        if f1 > best_f1: best_f1, best_tau = f1, float(tau)
+        prec = tp / (tp + fp + 1e-8); rec  = tp / (tp + fn + 1e-8)
+        f1   = 2 * prec * rec / (prec + rec + 1e-8)
+        if f1 > best_f1:
+            best_f1, best_tau = f1, float(tau)
     return best_tau, best_f1
 
 def compute_pos_weight_from_labels(y_bin: torch.Tensor) -> float:
     pos = float((y_bin > 0.5).sum()); neg = float((y_bin <= 0.5).sum())
     return (neg / pos) if pos > 0 else 1.0
 
-# ----------------------------- eval (regress/classify)
+# -----------------------------
+# 평가 (회귀/분류 공용; 롤링윈도우 유지)
+# -----------------------------
 @torch.no_grad()
 def eval_model(model, X: torch.Tensor, L: int, desc="eval", heartbeat_sec=5,
                task: str = "regress", bin_rule: str = "nonzero", bin_thr: float = 0.0,
@@ -183,8 +215,8 @@ def eval_model(model, X: torch.Tensor, L: int, desc="eval", heartbeat_sec=5,
 
     def binarize(y_next: torch.Tensor) -> torch.Tensor:
         if bin_rule == "nonzero": return (y_next != 0).float()
-        if bin_rule == "gt": return (y_next > bin_thr).float()
-        if bin_rule == "ge": return (y_next >= bin_thr).float()
+        if bin_rule == "gt":      return (y_next > bin_thr).float()
+        if bin_rule == "ge":      return (y_next >= bin_thr).float()
         return (y_next != 0).float()
 
     if USE_RICH:
@@ -192,10 +224,9 @@ def eval_model(model, X: torch.Tensor, L: int, desc="eval", heartbeat_sec=5,
                   refresh_per_second=8, console=console) as live:
             for i in range(N):
                 row = X[i].unsqueeze(0)
-                Xw, Yw_reg = build_windows_dataset(row, L)
+                Xw, Yw_reg, _, _ = build_windows_dataset(row, L)
                 if Xw.numel() == 0: continue
                 Xw = Xw.to(dev, non_blocking=True)
-
                 if task == "regress":
                     Yw = Yw_reg.to(dev, non_blocking=True)
                     pred, _ = model(Xw)
@@ -221,7 +252,7 @@ def eval_model(model, X: torch.Tensor, L: int, desc="eval", heartbeat_sec=5,
     else:
         for i in range(N):
             row = X[i].unsqueeze(0)
-            Xw, Yw_reg = build_windows_dataset(row, L)
+            Xw, Yw_reg, _, _ = build_windows_dataset(row, L)
             if Xw.numel() == 0: continue
             Xw = Xw.to(dev, non_blocking=True)
             if task == "regress":
@@ -245,13 +276,16 @@ def eval_model(model, X: torch.Tensor, L: int, desc="eval", heartbeat_sec=5,
 
     if task == "regress":
         return (float(np.mean(mse_list)) if mse_list else float("nan"),
-                float(np.mean(mae_list)) if mae_list else float("nan"), None, None)
+                float(np.mean(mae_list)) if mae_list else float("nan"),
+                None, None)
     else:
         yprob = torch.cat(prob_buf, dim=0) if prob_buf else torch.empty(0)
         ytrue = torch.cat(true_buf, dim=0) if true_buf else torch.empty(0)
         return None, None, ytrue, yprob
 
-# ----------------------------- plots
+# -----------------------------
+# 플롯 유틸
+# -----------------------------
 def plot_samples(model, X: torch.Tensor, L: int, outdir: str, k: int = 3, prefix: str = "after"):
     ensure_outdir(outdir); plots_dir = os.path.join(outdir, "plots"); ensure_outdir(plots_dir)
     model.eval(); dev = next(model.parameters()).device
@@ -260,7 +294,7 @@ def plot_samples(model, X: torch.Tensor, L: int, outdir: str, k: int = 3, prefix
     for i in range(min(k, N)):
         row = X[i]; preds = torch.full((C, T), float("nan"))
         Lc = max(1, min(L, T-1))
-        Xw, _ = build_windows_dataset(row.unsqueeze(0), Lc)
+        Xw, _, _, _ = build_windows_dataset(row.unsqueeze(0), Lc)
         with torch.no_grad():
             pred, _ = model(Xw.to(dev, non_blocking=True)); pred = pred.cpu()
         preds[:, Lc:] = pred.T
@@ -296,40 +330,34 @@ def plot_cls_curves(y_true: torch.Tensor, y_prob: torch.Tensor, tau: float, outd
         tp = np.sum((yhat==1) & (yt==1)); fp = np.sum((yhat==1) & (yt==0)); fn = np.sum((yhat==0) & (yt==1))
         prec = tp / (tp + fp + 1e-8); rec = tp / (tp + fn + 1e-8)
         f1s.append(2*prec*rec / (prec + rec + 1e-8))
-    plt.figure(figsize=(9,5))
-    plt.plot(taus, f1s); plt.axvline(tau, ls="--")
+    plt.figure(figsize=(9,5)); plt.plot(taus, f1s); plt.axvline(tau, ls="--")
     plt.xlabel("Threshold τ"); plt.ylabel("F1"); plt.title("F1 vs Threshold")
     plt.tight_layout(); plt.savefig(os.path.join(plots_dir, f"{prefix}_f1_vs_threshold.png")); plt.close()
 
-    # 2) PR curve (threshold sweep, high→low)
+    # 2) PR curve
     order = np.argsort(-yp)
     tp=fp=0; fn=int(np.sum(yt==1)); precs=[]; recs=[]
     for idx in order:
         if yt[idx]==1: tp+=1; fn-=1
         else: fp+=1
         precs.append(tp / (tp+fp + 1e-8)); recs.append(tp / (tp+fn + 1e-8))
-    plt.figure(figsize=(6,6))
-    plt.plot(recs, precs)
+    plt.figure(figsize=(6,6)); plt.plot(recs, precs)
     plt.xlabel("Recall"); plt.ylabel("Precision"); plt.title("Precision-Recall")
     plt.tight_layout(); plt.savefig(os.path.join(plots_dir, f"{prefix}_pr.png")); plt.close()
 
-    # (NEW) 2-1) Precision/Recall vs Threshold
-    taus_dense = np.linspace(0, 1, 501)
-    prec_l, rec_l = [], []
-    P = max(1, int(np.sum(yt==1))); Nn = max(1, int(np.sum(yt==0)))
+    # 2-1) Precision/Recall vs Threshold
+    taus_dense = np.linspace(0, 1, 501); prec_l, rec_l = [], []
     for t in taus_dense:
         yhat = (yp >= t).astype(np.float32)
         tp = np.sum((yhat==1) & (yt==1))
         fp = np.sum((yhat==1) & (yt==0))
         fn = np.sum((yhat==0) & (yt==1))
-        prec = tp / (tp + fp + 1e-8)
-        rec  = tp / (tp + fn + 1e-8)
+        prec = tp / (tp + fp + 1e-8); rec  = tp / (tp + fn + 1e-8)
         prec_l.append(prec); rec_l.append(rec)
     plt.figure(figsize=(9,5))
     plt.plot(taus_dense, prec_l, label="Precision")
     plt.plot(taus_dense, rec_l, label="Recall")
-    plt.axvline(tau, ls="--")
-    plt.xlabel("Threshold τ"); plt.ylabel("Score"); plt.legend()
+    plt.axvline(tau, ls="--"); plt.xlabel("Threshold τ"); plt.ylabel("Score"); plt.legend()
     plt.title("Precision / Recall vs Threshold")
     plt.tight_layout(); plt.savefig(os.path.join(plots_dir, f"{prefix}_precision_recall_vs_threshold.png")); plt.close()
 
@@ -341,8 +369,7 @@ def plot_cls_curves(y_true: torch.Tensor, y_prob: torch.Tensor, tau: float, outd
         tp = np.sum((yhat==1) & (yt==1)); fn = np.sum((yhat==0) & (yt==1))
         fp = np.sum((yhat==1) & (yt==0)); tn = np.sum((yhat==0) & (yt==0))
         tprs.append(tp / (P + 1e-8)); fprs.append(fp / (Nn + 1e-8))
-    plt.figure(figsize=(6,6))
-    plt.plot(fprs, tprs); plt.plot([0,1],[0,1], ls="--")
+    plt.figure(figsize=(6,6)); plt.plot(fprs, tprs); plt.plot([0,1],[0,1], ls="--")
     plt.xlabel("FPR"); plt.ylabel("TPR"); plt.title("ROC")
     plt.tight_layout(); plt.savefig(os.path.join(plots_dir, f"{prefix}_roc.png")); plt.close()
 
@@ -360,23 +387,26 @@ def plot_cls_curves(y_true: torch.Tensor, y_prob: torch.Tensor, tau: float, outd
     fp = int(np.sum((yhat==1) & (yt==0)))
     fn = int(np.sum((yhat==0) & (yt==1)))
     cm = np.array([[tn, fp],[fn, tp]])
-    plt.figure(figsize=(4.2,4.2))
-    plt.imshow(cm, cmap="Blues")
+    plt.figure(figsize=(4.2,4.2)); plt.imshow(cm, cmap="Blues")
     for (i,j), val in np.ndenumerate(cm):
         plt.text(j, i, str(val), ha="center", va="center")
     plt.xticks([0,1], ["0","1"]); plt.yticks([0,1], ["0","1"])
     plt.xlabel("Pred"); plt.ylabel("True"); plt.title(f"Confusion @ τ={tau:.3f}")
     plt.tight_layout(); plt.savefig(os.path.join(plots_dir, f"{prefix}_confusion.png")); plt.close()
 
-# ----------------------------- train loop
+# -----------------------------
+# 학습 루프
+# -----------------------------
 def train_all_epochs(model, dl: DataLoader, opt, scaler: GradScaler,
                      epochs:int, amp_enabled:bool=True,
                      log_every:int=50, heartbeat_sec:int=5, compiled:str|None=None,
                      task:str="regress", alpha:float=0.5,
-                     pos_weight_mode:str="global", global_pos_weight:Optional[float]=None):
+                     pos_weight_mode:str="global", global_pos_weight:Optional[float]=None) -> List[float]:
     dev = next(model.parameters()).device
-    total_steps = epochs * len(dl); step_counter = 0
-    last = time.time(); avg_step_time = None
+    total_steps = epochs * len(dl)
+    step_counter = 0
+    last = time.time()
+    avg_step_time = None
 
     softf1 = SoftF1Loss() if task == "classify" else None
     bce_loss_fn = None
@@ -397,6 +427,7 @@ def train_all_epochs(model, dl: DataLoader, opt, scaler: GradScaler,
         done = step_counter; remaining = (total_steps - done) * (avg_step_time if avg_step_time else 0.0)
         lr = opt.param_groups[0].get("lr", 0.0)
         mem = (torch.cuda.memory_allocated()/ (1024**2)) if torch.cuda.is_available() else 0.0
+
         if USE_RICH:
             table = build_train_table(ep, epochs, bi, len(dl),
                                       done, total_steps, loss_cur, loss_avg, lr,
@@ -421,9 +452,8 @@ def train_all_epochs(model, dl: DataLoader, opt, scaler: GradScaler,
             for bi, (xb, yb) in enumerate(dl):
                 xb = xb.to(dev, non_blocking=True); yb = yb.to(dev, non_blocking=True)
                 opt.zero_grad(set_to_none=True)
-
                 if amp_enabled:
-                    with autocast():
+                    with amp.autocast(device_type='cuda', enabled=True):
                         logits, _ = model(xb)
                         if task == "regress":
                             loss = F.mse_loss(logits, yb)
@@ -461,7 +491,61 @@ def train_all_epochs(model, dl: DataLoader, opt, scaler: GradScaler,
         else: print()
     return epoch_loss_hist
 
-# ----------------------------- main
+# -----------------------------
+# split 헬퍼
+# -----------------------------
+def make_splits(Xw_all: torch.Tensor, Yw_all: torch.Tensor, groups: torch.Tensor,
+                N: int, T: int, L: int, W: int, mode: str, val_ratio: float, seed: int):
+    """
+    mode:
+      - window: 윈도우 전체에서 랜덤 split (누수 가능)
+      - item: 아이템(행) 단위 split → 각 집합의 윈도우만 선택
+      - time: 각 아이템별 윈도우 축을 앞/뒤로 시계열 분할 (겹침 없음)
+      - group: GroupShuffleSplit으로 group-aware split (기본)
+    """
+    g = torch.Generator().manual_seed(seed)
+
+    if mode == "window":
+        total = Xw_all.shape[0]
+        idx = torch.randperm(total, generator=g)
+        val_size = int(total * val_ratio)
+        val_idx = idx[:val_size]; trn_idx = idx[val_size:]
+        return trn_idx.tolist(), val_idx.tolist()
+
+    if mode == "item":
+        n_items = N
+        n_val = int(max(1, round(n_items * val_ratio)))
+        perm = torch.randperm(n_items, generator=g)
+        val_items = set(perm[:n_val].tolist()); trn_items = set(perm[n_val:].tolist())
+        trn_idx = [i for i, gg in enumerate(groups.tolist()) if gg in trn_items]
+        val_idx = [i for i, gg in enumerate(groups.tolist()) if gg in val_items]
+        return trn_idx, val_idx
+
+    if mode == "time":
+        # 각 아이템별 윈도우 인덱스 범위: [k*W, (k+1)*W)
+        # 앞쪽 floor(W*(1-val_ratio)) → train, 뒤쪽 → val (겹침 없음)
+        trn_idx, val_idx = [], []
+        cutoff_w = int(max(1, math.floor(W * (1 - val_ratio))))
+        for k in range(N):
+            start = k * W
+            trn_idx.extend(range(start, start + cutoff_w))
+            val_idx.extend(range(start + cutoff_w, start + W))
+        return trn_idx, val_idx
+
+    # group (기본)
+    try:
+        from sklearn.model_selection import GroupShuffleSplit
+    except Exception as e:
+        print(f"[WARN] sklearn not available ({e}); fallback to item split.")
+        return make_splits(Xw_all, Yw_all, groups, N, T, L, W, mode="item", val_ratio=val_ratio, seed=seed)
+
+    gss = GroupShuffleSplit(n_splits=1, test_size=val_ratio, random_state=seed)
+    trn_idx, val_idx = next(gss.split(np.zeros(len(groups)), np.zeros(len(groups)), groups.numpy()))
+    return trn_idx.tolist(), val_idx.tolist()
+
+# -----------------------------
+# 메인
+# -----------------------------
 def main():
     ap = argparse.ArgumentParser()
     # 입력
@@ -485,30 +569,37 @@ def main():
     ap.add_argument("--plot-samples", type=int, default=3)
     ap.add_argument("--log-every", type=int, default=50)
 
-    # 분류 전용
-    ap.add_argument("--alpha", type=float, default=0.5)
+    # 분류 전용 하이퍼파라미터
+    ap.add_argument("--alpha", type=float, default=0.5, help="하이브리드 손실 가중치(BCE 비중)")
     ap.add_argument("--pos-weight", type=str, default="global", choices=["global","batch","none"])
-    ap.add_argument("--thresh-default", type=float, default=0.5)
-    ap.add_argument("--val-ratio", type=float, default=0.2)
-    ap.add_argument("--bin-rule", type=str, default="nonzero", choices=["nonzero","gt","ge"])
-    ap.add_argument("--bin-thr", type=float, default=0.0)
+    ap.add_argument("--thresh-default", type=float, default=0.5, help="F1 탐색 실패시 기본 임계값")
+    ap.add_argument("--val-ratio", type=float, default=0.2, help="검증 비율")
+    ap.add_argument("--bin-rule", type=str, default="nonzero", choices=["nonzero","gt","ge"],
+                    help="분류 타깃 생성 규칙: nonzero(기본), gt(>thr), ge(>=thr)")
+    ap.add_argument("--bin-thr", type=float, default=0.0, help="--bin-rule gt/ge에서 사용")
 
-    # 리소스
+    # 리소스/성능
     ap.add_argument("--batch-size", type=int, default=4096)
     ap.add_argument("--num-workers", type=int, default=4)
-    ap.add_argument("--amp", action="store_true")
-    ap.add_argument("--compile", type=str, default="", help='""|"reduce-overhead"|"max-autotune"')
+    ap.add_argument("--amp", action="store_true", help="enable mixed precision (AMP)")
+    ap.add_argument("--compile", type=str, default="", help='torch.compile mode: "", "reduce-overhead", "max-autotune"')
     ap.add_argument("--eval-batch-size", type=int, default=4096)
 
+    # split 옵션 (NEW)
+    ap.add_argument("--split-mode", type=str, default="group",
+                    choices=["group","item","time","window"],
+                    help="데이터 분할 방식: group(기본, 누수방지), item(행), time(앞/뒤), window(랜덤, 누수 위험)")
+
     # 체크포인트
-    ap.add_argument("--ckpt", type=str, default=None)
+    ap.add_argument("--ckpt", type=str, default=None, help="pretrained checkpoint for finetune/infer")
 
     args = ap.parse_args()
     set_seed(args.seed)
     out_dir = make_run_dir(args)
 
-    # 데이터
-    X = parse_csvs(args); N, C, T = X.shape
+    # 데이터 로드
+    X = parse_csvs(args)   # [N,C,T]
+    N, C, T = X.shape
 
     # context_len 보정
     if args.context_len >= T:
@@ -522,6 +613,7 @@ def main():
     model, _ = load_model_and_cfg(backbone=args.backbone, in_channels=C)
     model = model.to(device=args.device, dtype=torch.float32)
 
+    # torch.compile
     compiled_mode = None
     if args.compile:
         try:
@@ -531,9 +623,9 @@ def main():
         except Exception as e:
             print(f"[WARN] torch.compile failed: {e}", flush=True)
 
-    print(f"[INFO] start | mode={args.mode}, task={args.task}, N={N},C={C},T={T},context={args.context_len},params={sum(p.numel() for p in model.parameters())}", flush=True)
+    print(f"[INFO] start | mode={args.mode}, task={args.task}, split={args.split_mode}, N={N},C={C},T={T},context={args.context_len},params={sum(p.numel() for p in model.parameters())}", flush=True)
 
-    # ---- infer
+    # ---- infer ----
     if args.mode == "infer":
         if not args.ckpt: raise SystemExit("--mode infer 는 --ckpt 가 필요합니다.")
         sd = torch.load(args.ckpt, map_location="cpu")
@@ -567,7 +659,7 @@ def main():
         print(f"[DONE] infer saved to {out_dir}", flush=True)
         return
 
-    # ---- train/finetune
+    # ---- train/finetune 준비 ----
     if args.mode == "finetune":
         if not args.ckpt: raise SystemExit("--mode finetune 는 --ckpt 가 필요합니다.")
         sd = torch.load(args.ckpt, map_location="cpu")
@@ -575,53 +667,58 @@ def main():
         missing, unexpected = model.load_state_dict(sd, strict=False)
         print(f"[INFO] ckpt loaded (missing={len(missing)}, unexpected={len(unexpected)})", flush=True)
 
+    # BEFORE eval
     print("[INFO] starting BEFORE eval...", flush=True)
     if args.task == "regress":
         bmse, bmae, _, _ = eval_model(model, X, args.context_len, desc="before", heartbeat_sec=5, task="regress")
         print(f"[BEFORE] MSE={bmse:.6f} MAE={bmae:.6f}", flush=True)
     else:
-        _, _, ytrue_b, yprob_b = eval_model(model, X, args.context_len, desc="before",
-                                            heartbeat_sec=5, task="classify",
-                                            bin_rule=args.bin_rule, bin_thr=args.bin_thr,
+        _, _, ytrue_b, yprob_b = eval_model(model, X, args.context_len, desc="before", heartbeat_sec=5,
+                                            task="classify", bin_rule=args.bin_rule, bin_thr=args.bin_thr,
                                             tau_for_cls=args.thresh_default)
         if yprob_b is not None and yprob_b.numel():
             rep_b = metrics_from_probs(ytrue_b, yprob_b, threshold=args.thresh_default)
-            print(f"[BEFORE-CLS] τ={rep_b['threshold']:.3f} | F1={rep_b['F1']:.6f} "
-                  f"Acc={rep_b['Accuracy']:.6f} P={rep_b['Precision']:.6f} R={rep_b['Recall']:.6f} "
+            print(f"[BEFORE-CLS] τ={rep_b['threshold']:.3f} | "
+                  f"F1={rep_b['F1']:.6f} Acc={rep_b['Accuracy']:.6f} "
+                  f"P={rep_b['Precision']:.6f} R={rep_b['Recall']:.6f} "
                   f"(MSE={rep_b['MSE']:.6f}, MAE={rep_b['MAE']:.6f})", flush=True)
             plot_cls_curves(ytrue_b, yprob_b, args.thresh_default, out_dir, prefix="before")
 
-    Xw_all, Yw_next = build_windows_dataset(X, args.context_len)
+    # 윈도우 구성 + (분류) 타깃 변환
+    Xw_all, Yw_next, groups, W = build_windows_dataset(X, args.context_len)  # W = 아이템당 윈도우 수
     if args.task == "regress":
         Yw_all = Yw_next
     else:
-        if args.bin_rule == "nonzero": Yw_all = (Yw_next != 0).float()
-        elif args.bin_rule == "gt":   Yw_all = (Yw_next > args.bin_thr).float()
-        else:                          Yw_all = (Yw_next >= args.bin_thr).float()
+        if args.bin_rule == "nonzero":
+            Yw_all = (Yw_next != 0).float()
+        elif args.bin_rule == "gt":
+            Yw_all = (Yw_next > args.bin_thr).float()
+        else:  # ge
+            Yw_all = (Yw_next >= args.bin_thr).float()
 
-    total = Xw_all.shape[0]
-    idx = torch.arange(total); g = torch.Generator().manual_seed(args.seed)
-    perm = idx[torch.randperm(total, generator=g)]
-    val_size = int(total * args.val_ratio) if args.task == "classify" else 0
-    val_idx = perm[:val_size] if val_size > 0 else torch.empty(0, dtype=torch.long)
-    trn_idx = perm[val_size:] if val_size > 0 else perm
+    # split (NEW)
+    trn_idx, val_idx = make_splits(Xw_all, Yw_all, groups, N, T, args.context_len, W,
+                                   args.split_mode, args.val_ratio, args.seed)
+    print(f"[INFO] split={args.split_mode} train_windows={len(trn_idx)} val_windows={len(val_idx)}", flush=True)
 
-    Xw_trn, Yw_trn = Xw_all[trn_idx], Yw_all[trn_idx]
-    Xw_val, Yw_val = (Xw_all[val_idx], Yw_all[val_idx]) if val_size > 0 else (None, None)
-
-    ds = TensorDataset(Xw_trn, Yw_trn)
-    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
+    ds = TensorDataset(Xw_all, Yw_all)
+    dl = DataLoader(Subset(ds, trn_idx), batch_size=args.batch_size, shuffle=True,
                     num_workers=args.num_workers, pin_memory=True,
                     drop_last=False, persistent_workers=True if args.num_workers>0 else False)
+    vl = DataLoader(Subset(ds, val_idx), batch_size=max(1, args.eval_batch_size), shuffle=False,
+                    num_workers=0, pin_memory=True)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = GradScaler(enabled=args.amp)
 
+    # 전역 pos_weight
     global_pw = None
     if args.task == "classify" and args.pos_weight != "none":
-        global_pw = compute_pos_weight_from_labels(Yw_trn)
+        y_trn = Yw_all[trn_idx]
+        global_pw = compute_pos_weight_from_labels(y_trn)
         print(f"[INFO] pos_weight(global) = {global_pw:.6f} (mode={args.pos_weight})", flush=True)
 
+    # 학습
     loss_hist = train_all_epochs(model, dl, opt, scaler,
                                  epochs=args.epochs, amp_enabled=args.amp,
                                  log_every=args.log_every, heartbeat_sec=5, compiled=compiled_mode,
@@ -629,6 +726,7 @@ def main():
                                  pos_weight_mode=args.pos_weight, global_pos_weight=global_pw)
     plot_training_curve(loss_hist, out_dir, title="Training Loss")
 
+    # AFTER eval + (분류) τ 선택/리포트
     print("[INFO] starting AFTER eval...", flush=True)
     if args.task == "regress":
         amse, amae, _, _ = eval_model(model, X, args.context_len, desc="after", heartbeat_sec=5, task="regress")
@@ -638,26 +736,27 @@ def main():
             f.write(f"after  MSE {amse:.6f} MAE {amae:.6f}\n")
         plot_samples(model, X, args.context_len, out_dir, k=args.plot_samples, prefix="after")
     else:
-        if (Xw_val is not None) and (Yw_val is not None) and (Xw_val.numel() > 0):
-            dev = args.device; eval_bs = max(1, args.eval_batch_size)
-            probs_chunks = []
-            with torch.no_grad():
-                for i in range(0, Xw_val.size(0), eval_bs):
-                    xb = Xw_val[i:i+eval_bs].to(dev, non_blocking=True)
-                    if args.amp:
-                        with autocast(): logits_b, _ = model(xb)
-                    else:
-                        logits_b, _ = model(xb)
-                    probs_chunks.append(torch.sigmoid(logits_b).cpu())
+        # 검증 윈도우에서 τ 선택 (OOM 방지 배치 추론; ✅ xb/yb 차원 보존)
+        probs_chunks = []; yv_chunks = []
+        dev = args.device
+        with torch.no_grad():
+            for xb, yb in vl:
+                xb = xb.to(dev, non_blocking=True)
+                with amp.autocast(device_type='cuda', enabled=args.amp):
+                    logits_b, _ = model(xb)
+                probs_chunks.append(torch.sigmoid(logits_b).detach().cpu())
+                yv_chunks.append(yb.detach().cpu())
+        if probs_chunks:
             probs_val = torch.cat(probs_chunks, dim=0)
-            tau, f1_at_tau = find_best_threshold_for_f1(Yw_val.cpu(), probs_val, step=0.001)
+            y_val = torch.cat(yv_chunks, dim=0)
+            tau, f1_at_tau = find_best_threshold_for_f1(y_val, probs_val, step=0.001)
         else:
             tau, f1_at_tau = args.thresh_default, float("nan")
             print("[WARN] 검증 분할이 없어 τ 기본값을 사용합니다.", flush=True)
 
-        _, _, ytrue_all, yprob_all = eval_model(model, X, args.context_len, desc="after",
-                                                heartbeat_sec=5, task="classify",
-                                                bin_rule=args.bin_rule, bin_thr=args.bin_thr,
+        # 전체 데이터로 최종 리포트 + 플롯
+        _, _, ytrue_all, yprob_all = eval_model(model, X, args.context_len, desc="after", heartbeat_sec=5,
+                                                task="classify", bin_rule=args.bin_rule, bin_thr=args.bin_thr,
                                                 tau_for_cls=tau)
         rep = metrics_from_probs(ytrue_all, yprob_all, threshold=tau)
         print(f"[AFTER-CLS] Selected τ={rep['threshold']:.3f} | "
@@ -669,11 +768,12 @@ def main():
             f.write(f"F1 {rep['F1']:.6f} Acc {rep['Accuracy']:.6f} P {rep['Precision']:.6f} R {rep['Recall']:.6f}\n")
             f.write(f"(ref) MSE {rep['MSE']:.6f} MAE {rep['MAE']:.6f}\n")
 
-        # 그래프 저장 (PR/ROC/히스토/Confusion + NEW: PR vs τ)
         plot_cls_curves(ytrue_all, yprob_all, rep["threshold"], out_dir, prefix="after")
 
+    # 저장
     torch.save(model.state_dict(), os.path.join(out_dir, "model.pt"))
     print(f"[DONE] model/report/plots saved to {out_dir}", flush=True)
 
 if __name__ == "__main__":
     main()
+
