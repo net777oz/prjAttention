@@ -7,7 +7,7 @@ dst_csv = "data/SD0a.csv"
 arr = np.loadtxt(src_csv, delimiter=",", dtype=np.float32, encoding="utf-8-sig")
 
 n_rows, n_cols = arr.shape
-pad_cols = 31
+pad_cols = 27
 
 # (행, 31) 크기의 제로 배열 생성
 pad = np.zeros((n_rows, pad_cols), dtype=np.float32)
