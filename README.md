@@ -64,28 +64,48 @@ llm_ts/
 ## 빠른 시작
 
 ```bash
-# 학습
-python run_llmts.py \
-  --mode train --task classify \
-  --csv ./data/your.csv \
+1) TRAIN (처음부터 학습)
+
+1-2. 분류(classify)
+python run_llmts.py --mode train --task classify  \
+  --csv ./data/SPa.csv \
+  --context-len 31 \
+  --epochs 30 \
+  --batch-size 4096 \
+  --alpha 0.5 \
+  --pos-weight global \
+  --bin-rule nonzero --bin-thr 0.0 \
+  --thresh-default 0.5 \
+  --split-mode group --val-ratio 0.2 \
+  --amp --compile reduce-overhead
+
+
+
+2) FINETUNE (기학습 체크포인트에서 이어서)
+
+2-2. 분류
+python run_llmts.py --mode finetune --task classify \
+  --csv ./data/SD0a.csv \
   --context-len 31 \
   --epochs 3 \
   --batch-size 4096 \
-  --alpha 0.5 --pos-weight global \
-  --split-mode group
+  --alpha 0.5 \
+  --pos-weight global \
+  --bin-rule nonzero --bin-thr 0.0 \
+  --thresh-default 0.5 \
+  --ckpt ./artifacts/train_classify_ctx31_alpha0.50_pwglobal_llm_ts_seed777_splitgroup/model.pt \
+  --split-mode group --val-ratio 0.2 \
+  --amp --compile reduce-overhead
 
-# 파인튜닝
-python run_llmts.py \
-  --mode finetune --task classify \
-  --csv ./data/your.csv \
+(아래건 EPOCH 0으로 eval만 하는거)
+python run_llmts.py --mode finetune --task classify   --csv ./data/LP0a.csv   --context-len 31   --epochs 0   --batch-size 4096   --alpha 0.5   --pos-weight global   --bin-rule nonzero --bin-thr 0.0   --thresh-default 0.5   --ckpt ./artifacts/train_classify_ctx31_alpha0.50_pwglobal_llm_ts_seed777_splitgroup/model.pt   --split-mode group --val-ratio 0.2   --amp --compile reduce-overhead --out finetuneEPOCH0LP0a
+
+
+3) INFER (추론/평가만)
+
+3-2. 분류
+python run_llmts.py --mode infer --task classify \
+  --csv ./data/LP0a.csv \
   --context-len 31 \
-  --epochs 1 \
-  --ckpt ./artifacts/prev/model.pt
-
-# 추론
-python run_llmts.py \
-  --mode infer --task classify \
-  --csv ./data/your.csv \
-  --context-len 31 \
-  --ckpt ./artifacts/model.pt
-
+  --ckpt ./artifacts/finetune_classify_ctx31_alpha0.50_pwglobal_llm_ts_seed777_splitgroup/model.pt \
+  --thresh-default 0.911
