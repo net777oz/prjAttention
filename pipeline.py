@@ -1,53 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-╔════════════════════════════════════════════════════════════════════════════╗
-║ FILE: pipeline.py                                                         ║
-╠───────────────────────────────────────────────────────────────────────────╣
-║ PURPOSE                                                                   ║
-║   Train / Finetune / Infer 오케스트레이션.                                ║
-║   데이터 로드 → 모델 준비 → (finetune/infer) ckpt 로드 → (옵션)컴파일     ║
-║   → split/학습/평가 → 리포트/플롯 → 저장.                                 ║
-╠───────────────────────────────────────────────────────────────────────────╣
-║ PUBLIC INTERFACE                                                          ║
-║   main_run(args: argparse.Namespace) -> None                              ║
-╠───────────────────────────────────────────────────────────────────────────╣
-║ KEY BEHAVIORS                                                             ║
-║   • 체크포인트 로드 순서 고정:  “로드 먼저 → 컴파일 나중”                 ║
-║   • ckpt/모델 키 네임스페이스 표준화: 접두사(strip) + 교집합(shape 일치)  ║
-║     - 지원 접두사: "_orig_mod.", "module.", "model.", "backbone.",        ║
-║                    "net.", "network."                                     ║
-║   • torch.load(2.6+) 안전 로더(weights_only) → 실패 시 trusted 폴백       ║
-║   • 저장은 항상 언래핑(DDP/compile) 후 ‘클린 키’ + 메타 포함              ║
-║   • AMP/compile 표시와 실제 가용성 분리                                   ║
-╠───────────────────────────────────────────────────────────────────────────╣
-║ INPUT                                                                     ║
-║   args: argparse Namespace (cli.py에서 구성)                              ║
-║     - mode: {"train","finetune","infer"}                                  ║
-║     - task: {"regress","classify"}                                        ║
-║     - csv, context_len, epochs, batch_size, lr, weight_decay, ...         ║
-║     - amp(bool), compile(str|"")                                          ║
-║     - ckpt(path for finetune/infer)                                       ║
-╠───────────────────────────────────────────────────────────────────────────╣
-║ OUTPUT                                                                    ║
-║   artifacts/<run>/                                                        ║
-║     - model.pt (표준 저장 포맷)                                           ║
-║     - train_report.txt / infer_report.txt                                 ║
-║     - plots/*                                                             ║
-╠───────────────────────────────────────────────────────────────────────────╣
-║ MODULE RELATION                                                           ║
-║   cli.py → main_run(args)                                                 ║
-║   data.py    : set_seed, parse_csv_single, make_run_dir                   ║
-║   windows.py : build_windows_dataset                                      ║
-║   splits.py  : make_splits                                                ║
-║   trainer.py : train_all_epochs                                           ║
-║   evaler.py  : eval_model                                                 ║
-║   metrics.py : metrics_from_probs, find_best_threshold_for_f1,            ║
-║                compute_pos_weight_from_labels                             ║
-║   viz.py     : plot_samples, plot_training_curve, plot_cls_curves         ║
-║   ttm_flow.model : load_model_and_cfg(backbone, in_channels=1)            ║
-╚════════════════════════════════════════════════════════════════════════════╝
+pipeline.py — Train / Finetune / Infer 오케스트레이션 (다변량 입력 지원)
+변경 핵심:
+  • data.parse_csv_auto 로 [N,1,T] 또는 [N,C,T] 입력 허용
+  • in_channels=C 자동 검출 후 load_model_and_cfg(backbone, in_channels=C)
+  • 체크포인트 메타에 in_channels 반영(기존 형식 유지)
+  • 나머지 플로우/모듈 경계는 원본 유지
 """
-
 import os, time
 import torch
 import numpy as np
@@ -56,7 +15,7 @@ from typing import Optional, List, Tuple
 from ttm_flow.model import load_model_and_cfg  # 외부 의존(원본 유지)
 
 from config import DEFAULT_BASE_OUT
-from data import set_seed, parse_csv_single, make_run_dir
+from data import set_seed, parse_csv_auto, make_run_dir  # ← 변경: auto 사용
 from windows import build_windows_dataset
 from splits import make_splits
 from trainer import train_all_epochs
@@ -64,21 +23,17 @@ from evaler import eval_model
 from metrics import metrics_from_probs, find_best_threshold_for_f1, compute_pos_weight_from_labels
 from viz import plot_samples, plot_training_curve, plot_cls_curves
 
-
 # ===== 공통: 래퍼 언래핑 / 접두사 스트립 / 저장/로드 정책 =====
-
 _STRIP_PREFIXES = ("_orig_mod.", "module.", "model.", "backbone.", "net.", "network.")
 
 def _get_base_module(model):
-    """DDP/compile 래퍼를 벗겨 실제 원본 nn.Module 반환"""
     m = getattr(model, "module", model)    # DDP unwrap
     m = getattr(m, "_orig_mod", m)         # torch.compile unwrap
     return m
 
 def _strip_prefix(k: str) -> str:
     for p in _STRIP_PREFIXES:
-        if k.startswith(p):
-            return k[len(p):]
+        if k.startswith(p): return k[len(p):]
     return k
 
 def _save_ckpt(model, args, out_path: str):
@@ -89,7 +44,7 @@ def _save_ckpt(model, args, out_path: str):
     meta = {
         "backbone": args.backbone,
         "task": args.task,
-        "in_channels": 1,
+        "in_channels": int(getattr(args, "_in_channels", 1)),  # ← 채널 수 반영
         "context_len": args.context_len,
         "split_mode": args.split_mode,
         "seed": args.seed,
@@ -100,18 +55,10 @@ def _save_ckpt(model, args, out_path: str):
     print(f"[DONE] saved checkpoint to {out_path}", flush=True)
 
 def _load_ckpt_if_needed(model, args):
-    """1) 안전 로더(weights_only=True) 시도(+allowlist), 실패 시 trusted 폴백
-       2) 접두사 스트립
-       3) **원본 모듈(base)** state_dict와 교집합(shape 일치)만 로드
-       4) 교집합 과소시 명시적 실패(백본/버전/헤드/채널 차이 가시화)
-    """
     import torch
     from collections import Counter
-
     if not args.ckpt:
         raise SystemExit("--ckpt 가 필요합니다.")
-
-    # 1) 안전 로더
     raw = None
     try:
         try:
@@ -127,11 +74,7 @@ def _load_ckpt_if_needed(model, args):
         raw = torch.load(args.ckpt, map_location="cpu", weights_only=False)
 
     sd = raw.get("state_dict", raw)
-
-    # 2) ckpt 키 접두사 스트립
     sd = { _strip_prefix(k): v for k, v in sd.items() }
-
-    # 3) 원본 모듈 기준 교집합 로드
     base = _get_base_module(model)
     msd = base.state_dict()
 
@@ -139,11 +82,12 @@ def _load_ckpt_if_needed(model, args):
     miss = [k for k in msd if k not in sd]
     unexp = [k for k in sd if k not in msd]
 
-    print(f"[INFO] ckpt intersect={len(intersect)} / model={len(msd)} "
-          f"missing={len(miss)} unexpected={len(unexp)}", flush=True)
+    print(f"[INFO] ckpt intersect={len(intersect)} / model={len(msd)} missing={len(miss)} unexpected={len(unexp)}", flush=True)
 
     if len(intersect) < max(10, len(msd)//2):
-        def tops(keys): return Counter(k.split('.',1)[0] for k in keys).most_common(5)
+        def tops(keys): 
+            from collections import Counter
+            return Counter(k.split('.',1)[0] for k in keys).most_common(5)
         print("[ERROR] Large mismatch between ckpt and current model.")
         print("  - ckpt top prefixes:", tops(sd.keys()))
         print("  - model top prefixes:", tops(msd.keys()))
@@ -153,14 +97,9 @@ def _load_ckpt_if_needed(model, args):
     missing, unexpected = base.load_state_dict(msd, strict=False)
     print(f"[INFO] partial load done (missing={len(missing)}, unexpected={len(unexpected)})", flush=True)
 
-
-# ===== compile 적용은 “로드 후”에만 =====
-
 def _maybe_compile(model, args):
-    """체크포인트 로드가 끝난 후에만 compile 적용"""
     compiled_mode = None
     if args.compile:
-        # reduce-overhead 등 비-맥스오토튠 모드에서 noisy 경고 억제
         if args.compile != "max-autotune":
             try:
                 from torch._inductor import config as inductor_config
@@ -175,9 +114,6 @@ def _maybe_compile(model, args):
             print(f"[WARN] torch.compile failed: {e}", flush=True)
     return model, compiled_mode
 
-
-# ===== 기타 보조 =====
-
 def _maybe_fix_context_len(args, T: int):
     if args.context_len >= T:
         print(f"ATN [WARN] context_len({args.context_len}) >= T({T}) → auto-set to T-1", flush=True)
@@ -186,23 +122,23 @@ def _maybe_fix_context_len(args, T: int):
         print(f"ATN [WARN] context_len({args.context_len}) < 1 → auto-set to 1", flush=True)
         args.context_len = 1
 
-
 # ===== 메인 =====
-
 def main_run(args):
     set_seed(args.seed)
-    out_dir = make_run_dir(args, DEFAULT_BASE_OUT)
 
-    # 데이터
-    X = parse_csv_single(args)          # [N,1,T]
-    N, C, T = X.shape                   # C=1 고정
+    # 데이터: 단일/다중 자동
+    X = parse_csv_auto(args)            # [N,1,T] 또는 [N,C,T]
+    N, C, T = X.shape
+    args._in_channels = int(C)          # ← 채널 수를 args에 기록(메타/출력 이름 반영)
     _maybe_fix_context_len(args, T)
 
-    # AMP 실제 가용성 (플래그 + CUDA 장치)
+    out_dir = make_run_dir(args, DEFAULT_BASE_OUT)
+
+    # AMP 실제 가용성
     amp_available = bool(args.amp and torch.cuda.is_available() and str(args.device).startswith("cuda"))
 
-    # 1) 모델 생성 (여기선 compile 하지 않음)
-    model, _ = load_model_and_cfg(backbone=args.backbone, in_channels=1)
+    # 1) 모델 생성 (compile 전)
+    model, _ = load_model_and_cfg(backbone=args.backbone, in_channels=int(C))  # ← C 반영
     model = model.to(device=args.device, dtype=torch.float32)
     compiled_mode = None
 
@@ -219,11 +155,11 @@ def main_run(args):
         flush=True,
     )
 
-    # 2) finetune/infer이면 먼저 ckpt 로드(원본 모듈 기준)
+    # 2) finetune/infer이면 먼저 ckpt 로드
     if args.mode in ("finetune", "infer"):
         _load_ckpt_if_needed(model, args)
 
-    # 3) 그 다음에 compile 적용 (필요 시)
+    # 3) compile 적용(필요 시)
     model, compiled_mode = _maybe_compile(model, args)
 
     # ---- INFER ----
@@ -322,7 +258,7 @@ def main_run(args):
     # 옵티마이저
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    # GradScaler (권장 API, 실제 가용성 반영)
+    # GradScaler
     from torch import amp as torch_amp
     scaler = torch_amp.GradScaler("cuda", enabled=amp_available)
 
@@ -333,7 +269,7 @@ def main_run(args):
         global_pw = compute_pos_weight_from_labels(y_trn)
         print(f"[INFO] pos_weight(global) = {global_pw:.6f} (mode={args.pos_weight})", flush=True)
 
-    # 학습 (AMP 실제 가용성 기준 전달)
+    # 학습
     loss_hist = train_all_epochs(
         model, dl, opt, scaler,
         epochs=args.epochs,
@@ -355,7 +291,6 @@ def main_run(args):
             f.write(f"after  MSE {amse:.6f} MAE {amae:.6f}\n")
         plot_samples(model, X, args.context_len, out_dir, k=args.plot_samples, prefix="after")
     else:
-        # 검증 윈도우 기반 τ 선택 (배치 추론, OOM-안전)
         probs_chunks, yv_chunks = [], []
         with torch.no_grad():
             for xb, yb in vl:
@@ -376,7 +311,6 @@ def main_run(args):
             tau, f1_at_tau = args.thresh_default, float("nan")
             print("[WARN] 검증 분할이 없어 τ 기본값을 사용합니다.", flush=True)
 
-        # 전체 데이터 리포트 + 플롯
         _, _, ytrue_all, yprob_all = eval_model(
             model, X, args.context_len, desc="after",
             task="classify", bin_rule=args.bin_rule, bin_thr=args.bin_thr,
@@ -396,6 +330,6 @@ def main_run(args):
             f.write(f"(ref) MSE {rep['MSE']:.6f} MAE {rep['MAE']:.6f}\n")
         plot_cls_curves(ytrue_all, yprob_all, rep["threshold"], out_dir, prefix="after")
 
-    # 표준 저장
+    # 표준 저장 (메타에 in_channels 포함)
     _save_ckpt(model, args, os.path.join(out_dir, "model.pt"))
     print(f"[DONE] model/report/plots saved to {out_dir}", flush=True)

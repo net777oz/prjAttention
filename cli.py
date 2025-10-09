@@ -1,30 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-╔════════════════════════════════════════════════════════════════════════════╗
-║ FILE: cli.py                                                              ║
-╠───────────────────────────────────────────────────────────────────────────╣
-║ PURPOSE                                                                   ║
-║   CLI 파서 및 엔트리 함수. 기존 run_llmts.py의 인자와 기본값을 동일 유지.    ║
-╠───────────────────────────────────────────────────────────────────────────╣
-║ PUBLIC INTERFACE                                                          ║
-║   build_parser() -> argparse.ArgumentParser                               ║
-║   main() -> None                                                          ║
-╠───────────────────────────────────────────────────────────────────────────╣
-║ INPUT/OUTPUT                                                              ║
-║   IN : sys.argv                                                           ║
-║   OUT: 없음(파이프라인 호출)                                              ║
-╠───────────────────────────────────────────────────────────────────────────╣
-║ SIDE EFFECTS                                                              ║
-║   - 없음(파이프라인에서 파일 생성)                                        ║
-╠───────────────────────────────────────────────────────────────────────────╣
-║ EXCEPTIONS                                                                ║
-║   - argparse 가 잘못된 인자에 대해 SystemExit                            ║
-╠───────────────────────────────────────────────────────────────────────────╣
-║ DEPENDENCY GRAPH                                                          ║
-║   cli → pipeline.main_run                                                 ║
-╚════════════════════════════════════════════════════════════════════════════╝
-
-cli.py — 명령행 인터페이스
+cli.py — 명령행 인터페이스 (다변량 CSV 지원)
+- 변경점:
+  • --csv 를 단일/다중 경로 모두 수용(nargs='+')
+  • 나머지 인자/기본값/흐름은 동일
 [의존] pipeline.main_run
 [제공] main()
 """
@@ -34,7 +13,10 @@ from pipeline import main_run
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     # 입력
-    ap.add_argument("--csv", type=str, required=True, help="단일 CSV 경로 (헤더/인덱스 없음, [N,T])")
+    ap.add_argument(
+        "--csv", type=str, nargs="+", required=True,
+        help="하나 이상의 CSV 경로 (헤더/인덱스 없음, [N,T]). 여러 개 주면 다변량(C채널)로 처리"
+    )
 
     # 모드/작업/모델/학습/출력
     ap.add_argument("--mode", type=str, required=True, choices=["train","finetune","infer"])
@@ -75,4 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main():
     ap = build_parser()
     args = ap.parse_args()
+    # 항상 list 로 통일
+    if isinstance(args.csv, str):
+        args.csv = [args.csv]
     main_run(args)

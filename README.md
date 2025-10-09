@@ -1,111 +1,176 @@
-# llm_ts — 단일 CSV/단일 채널 LLM-스타일 시계열 Transformer
+# 🧠 AttentionProject
 
-## 디렉터리 구조
+**LLM-style Time-Series Forecasting & Classification Framework**
 
-llm_ts/
-├─ run_llmts.py # 엔트리포인트
-├─ cli.py # argparse & main
-├─ pipeline.py # E2E 오케스트레이션
-├─ config.py # 상수
-├─ data.py # CSV 로딩/시드/출력폴더
-├─ windows.py # 롤링 윈도우
-├─ splits.py # split-mode 구현
-├─ losses.py # SoftF1, BCE, pos_weight
-├─ metrics.py # 지표/τ 탐색
-├─ evaler.py # OOM-안전 평가
-├─ trainer.py # AMP/compile 대응 학습 루프
-├─ viz.py # 플롯(샘플/PR/ROC/Hist/Confusion/Loss)
-└─ utils.py # 공통 유틸 & rich 콘솔
+---
 
-╔═══════════════════════════════════════════════════════════════════════════╗
-║ SYSTEM OVERVIEW							    ║
-╠───────────────────────────────────────────────────────────────────────────╣
-║ PURPOSE 단일 CSV(헤더/인덱스 없음, [N,T]) 기반의 시계열 예측/분류 파이프  ║
-║ MODES --mode {train, finetune, infer} 				    ║
-║ TASKS --task {regress, classify}					    ║
-║ CONTEXT 롤링 윈도우 teacher-forcing 유지, τ는 검증 F1 최대 기준 선택      ║
-║ OUTPUTS artifacts/<run>/{model.pt, _report.txt, plots/.png}		    ║
-╠───────────────────────────────────────────────────────────────────────────╣
-║ MODULE GRAPH								    ║
-║ run_llmts → cli → pipeline → (config, data, windows, splits, trainer,	    ║
-║ evaler, metrics, losses, viz, utils)					    ║
-║ 모델 로드: ttm_flow.model.load_model_and_cfg(in_channels=1)		    ║
-╠───────────────────────────────────────────────────────────────────────────╣
-║ KEY INTERFACES							    ║
-║ data.parse_csv_single(args) -> Tensor[N,1,T]				    ║
-║ windows.build_windows_dataset(X,L) -> (Xw[NW,1,L], Yw[NW,1], groups,W)    ║
-║ splits.make_splits(...) -> (train_idx, val_idx)			    ║
-║ trainer.train_all_epochs(...) -> List[float] (epoch loss history)	    ║
-║ evaler.eval_model(...) -> (mse, mae, y_true, y_prob)			    ║
-║ metrics.find_best_threshold_for_f1(...) -> (tau, f1)			    ║
-║ viz.plot_* -> PNG 산출						    ║
-╠───────────────────────────────────────────────────────────────────────────╣
-║ IN/OUT SUMMARY							    ║
-║ IN : CSV [N,T], CLI 하이퍼파라미터					    ║
-║ OUT: 모델 가중치, 성능 리포트, 플롯					    ║
-╠───────────────────────────────────────────────────────────────────────────╣
-║ SIDE EFFECTS								    ║
-║ - artifacts/<run>/ 하위 파일/폴더 생성				    ║
-║ - CUDA/torch.compile/AMP 사용 시 그래프 캐시/메모리 점유		    ║
-╠───────────────────────────────────────────────────────────────────────────╣
-║ EXCEPTIONS								    ║
-║ - CSV 형식 오류/CKPT 로드 실패/장치 미지원 → 오류 메시지 후 종료	    ║
-╚════════════════════════════════════════════════════════════════════════════
+## 📘 개요
 
+AttentionProject는 시계열 데이터를 Transformer/LLM 기반으로 처리하기 위한  
+**모듈형 파이프라인**입니다.  
+데이터 로드 → 윈도우 생성 → 모델 로드 → 학습/추론 → 리포트 및 플롯을  
+모두 자동화하며, 단일 CSV뿐 아니라 **다변량(Multi-CSV)** 입력을 지원합니다.
 
-## 설치 요구
+---
 
-- Python 3.10+
-- PyTorch (CUDA 선택)
-- numpy, matplotlib, scikit-learn(옵션: group split 사용 시)
-- rich(옵션: 콘솔 UI)
-- 외부 모델 로더: `ttm_flow.model.load_model_and_cfg` (변경 없음)
+## 🧩 주요 특징
 
-## 빠른 시작
+| 구성요소 | 설명 |
+|-----------|------|
+| `cli.py` | 명령행 인자 파서 및 entry point (`run_llmts.py` 호출) |
+| `pipeline.py` | 전체 오케스트레이션 (데이터 로드 → 학습/추론 → 리포트 저장) |
+| `data.py` | CSV 파싱, 텐서 변환, 시드 고정 및 출력 경로 생성 |
+| `windows.py` | 슬라이딩 윈도우 데이터셋 생성 |
+| `splits.py` | 학습/검증 분할 로직 |
+| `trainer.py` | 모델 학습 루프 |
+| `evaler.py` | 모델 평가 (회귀/분류) |
+| `metrics.py` | F1, Accuracy, MAE, MSE 등 메트릭 계산 |
+| `viz.py` | 학습 곡선, 분류 ROC/PR 플롯 생성 |
+| `ttm_flow/model.py` | Granite TinyTimeMixer 기반 LLM-TS 백본 로더 |
+
+---
+
+## 🧮 입력 구조
+
+### 단변량 (기존)
+- 입력 CSV 1개 (`[N,T]`)
+- 자동 변환: `[N,1,T]`
 
 ```bash
-1) TRAIN (처음부터 학습)
+--csv ./data/SPa.csv
+다변량 (New)
+입력 CSV 여러 개 ([N,T] 동일 형태)
 
-1-2. 분류(classify)
-python run_llmts.py --mode train --task classify  \
-  --csv ./data/SPa.csv \
-  --context-len 31 \
-  --epochs 30 \
-  --batch-size 4096 \
-  --alpha 0.5 \
-  --pos-weight global \
-  --bin-rule nonzero --bin-thr 0.0 \
-  --thresh-default 0.5 \
+자동 변환: [N,C,T] (C = CSV 개수)
+
+첫 번째 CSV(x_main.csv)가 타겟 채널
+
+bash
+코드 복사
+--csv ./data/x_main.csv ./data/x_aux1.csv ./data/x_aux2.csv
+⚙️ 공통 인자 요약
+인자	설명	기본값
+--mode	train / finetune / infer	(필수)
+--task	regress / classify	regress
+--context-len	윈도우 길이	(필수)
+--epochs	학습 반복 횟수	1
+--batch-size	배치 크기	4096
+--alpha	분류용 F1 조합 가중치	0.5
+--pos-weight	양성 가중치 계산방식	global
+--bin-rule	분류 타겟 이진화 규칙	nonzero
+--bin-thr	이진화 기준값	0.0
+--split-mode	group / item / time / window	group
+--val-ratio	검증 데이터 비율	0.2
+--ckpt	checkpoint 경로	None
+--amp	자동 혼합정밀 (CUDA)	False
+--compile	torch.compile 모드	""
+--device	cuda / cpu 자동선택	cuda
+
+🚀 실행 예제
+🧠 Training
+새 모델 학습
+
+bash
+코드 복사
+python run_llmts.py --mode train --task classify \
+  --csv ./data/x_main.csv ./data/x_aux1.csv ./data/x_aux2.csv \
+  --context-len 31 --epochs 30 --batch-size 4096 \
+  --alpha 0.5 --pos-weight global \
+  --bin-rule nonzero --bin-thr 0.0 --thresh-default 0.5 \
   --split-mode group --val-ratio 0.2 \
   --amp --compile reduce-overhead
+다변량 입력: [N,3,T]
 
+첫 번째 CSV(x_main.csv)가 타겟
 
+저장: artifacts/train_classify_ctx31_ch3_* 폴더에
 
-2) FINETUNE (기학습 체크포인트에서 이어서)
+model.pt
 
-2-2. 분류
+train_report.txt
+
+plots/
+
+🔧 Finetune
+기존 모델 이어 학습
+
+bash
+코드 복사
 python run_llmts.py --mode finetune --task classify \
-  --csv ./data/SD0a.csv \
-  --context-len 31 \
-  --epochs 3 \
-  --batch-size 4096 \
-  --alpha 0.5 \
-  --pos-weight global \
-  --bin-rule nonzero --bin-thr 0.0 \
-  --thresh-default 0.5 \
-  --ckpt ./artifacts/train_classify_ctx31_alpha0.50_pwglobal_llm_ts_seed777_splitgroup/model.pt \
+  --csv ./data/x_main.csv ./data/x_aux1.csv ./data/x_aux2.csv \
+  --context-len 31 --epochs 10 --batch-size 4096 \
+  --alpha 0.5 --pos-weight global \
+  --bin-rule nonzero --bin-thr 0.0 --thresh-default 0.5 \
   --split-mode group --val-ratio 0.2 \
+  --ckpt ./artifacts/train_classify_ctx31_ch3_alpha0.50_pwglobal_llm_ts_seed777_splitgroup/model.pt \
   --amp --compile reduce-overhead
+🔍 Inference
+학습된 모델로 추론
 
-(아래건 EPOCH 0으로 eval만 하는거)
-python run_llmts.py --mode finetune --task classify   --csv ./data/LP0a.csv   --context-len 31   --epochs 0   --batch-size 4096   --alpha 0.5   --pos-weight global   --bin-rule nonzero --bin-thr 0.0   --thresh-default 0.5   --ckpt ./artifacts/train_classify_ctx31_alpha0.50_pwglobal_llm_ts_seed777_splitgroup/model.pt   --split-mode group --val-ratio 0.2   --amp --compile reduce-overhead --out finetuneEPOCH0LP0a
-
-
-3) INFER (추론/평가만)
-
-3-2. 분류
+bash
+코드 복사
 python run_llmts.py --mode infer --task classify \
-  --csv ./data/LP0a.csv \
+  --csv ./data/x_main.csv ./data/x_aux1.csv ./data/x_aux2.csv \
   --context-len 31 \
-  --ckpt ./artifacts/finetune_classify_ctx31_alpha0.50_pwglobal_llm_ts_seed777_splitgroup/model.pt \
-  --thresh-default 0.911
+  --ckpt ./artifacts/train_classify_ctx31_ch3_alpha0.50_pwglobal_llm_ts_seed777_splitgroup/model.pt \
+  --amp --compile reduce-overhead
+출력:
+
+infer_report.txt
+
+F1 / Accuracy / Precision / Recall / MSE / MAE
+
+plots/ 시각화
+
+model.pt (메타 정보 포함 저장)
+
+🧾 출력 구조
+파일	설명
+model.pt	원본 nn.Module의 state_dict + meta 정보
+train_report.txt	Before/After 성능 지표
+infer_report.txt	추론 결과 리포트
+plots/	손실 곡선, ROC/PR 플롯 등
+
+⚡ 성능 최적화
+Tensor Core GPU (RTX/Ampere+)에서 더 빠른 연산을 위해
+pipeline.py 또는 run_llmts.py 시작 부분에 아래 한 줄을 추가하세요.
+
+python
+코드 복사
+import torch
+torch.set_float32_matmul_precision('high')
+이 설정은 torch.matmul, nn.Linear, Attention 등에서
+FP32 → TF32 텐서코어 연산을 활성화하여 속도를 20~40% 향상시킵니다.
+
+🧠 Reference
+Granite TinyTimeMixer (TTM-R1)
+
+PyTorch torch.compile
+
+Automatic Mixed Precision (AMP)
+
+📁 프로젝트 구조
+markdown
+코드 복사
+prjAttention/
+├── run_llmts.py
+├── cli.py
+├── pipeline.py
+├── data.py
+├── windows.py
+├── splits.py
+├── trainer.py
+├── evaler.py
+├── metrics.py
+├── viz.py
+├── ttm_flow/
+│   ├── __init__.py
+│   ├── model.py
+│   └── ...
+└── artifacts/
+    └── (자동생성)
+🧩 요약
+모드	설명	출력
+train	새 모델 학습	model.pt, train_report.txt, plots/
+finetune	기존 모델 이어 학습	동일 폴더 내 재저장
+infer	추론 및 리포트 생성	infer_report.txt, plots/
