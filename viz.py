@@ -7,7 +7,8 @@
 ╠───────────────────────────────────────────────────────────────────────────╣
 ║ PUBLIC INTERFACE                                                          ║
 ║   plot_training_curve(loss_hist, outdir, title) -> None                   ║
-║   plot_samples(model, X:[N,1,T], L:int, outdir, k:int, prefix:str)        ║
+║   plot_samples(model, X:[N,1,T], L:int, outdir, k:int, prefix:str,        ║
+║                indices:Optional[List[int]])                                ║
 ║   plot_cls_curves(y_true, y_prob, tau, outdir, prefix) -> None            ║
 ╠───────────────────────────────────────────────────────────────────────────╣
 ║ SIDE EFFECTS  plots/*.png 파일 생성                                        ║
@@ -17,6 +18,7 @@
 viz.py — 플롯 유틸(시계열 샘플, F1-τ, PR/ROC, Hist, Confusion, Loss curve)
 """
 import os, numpy as np, torch, matplotlib.pyplot as plt
+from typing import Optional, List
 from windows import build_windows_dataset
 from data import ensure_outdir
 
@@ -27,12 +29,27 @@ def plot_training_curve(loss_hist, outdir:str, title="Training Loss"):
     plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title(title)
     plt.tight_layout(); plt.savefig(os.path.join(plots_dir, "train_loss.png")); plt.close()
 
-def plot_samples(model, X: torch.Tensor, L:int, outdir:str, k:int=3, prefix:str="after"):
+def plot_samples(model,
+                 X: torch.Tensor,
+                 L:int,
+                 outdir:str,
+                 k:int=3,
+                 prefix:str="after",
+                 indices: Optional[List[int]] = None):
+    """
+    indices: 플롯에 사용할 row 인덱스 서브셋(미지정 시 앞에서 k개)
+    """
     ensure_outdir(outdir); plots_dir = os.path.join(outdir, "plots"); ensure_outdir(plots_dir)
     model.eval(); dev = next(model.parameters()).device
     N, C, T = X.shape
-    for i in range(min(k, N)):
-        row = X[i]
+
+    rows = (indices if (indices is not None and len(indices) > 0)
+            else list(range(min(k, N))))
+
+    for j, ridx in enumerate(rows):
+        if not (0 <= ridx < N):  # 방어
+            continue
+        row = X[ridx]
         preds = torch.full((C, T), float("nan"))
         Lc = max(1, min(L, T-1))
         Xw, _, _, _ = build_windows_dataset(row.unsqueeze(0), Lc)
@@ -46,9 +63,9 @@ def plot_samples(model, X: torch.Tensor, L:int, outdir:str, k:int=3, prefix:str=
         if m.any():
             plt.plot(np.arange(T)[m], p_np[0][m], ls="--", linewidth=1.2, label=f"pred")
         plt.legend(loc="upper right", fontsize=9)
-        plt.title(f"row {i} (context={Lc})")
+        plt.title(f"row {ridx} (context={Lc})")
         plt.xlabel("time (col index)"); plt.ylabel("value")
-        plt.tight_layout(); plt.savefig(os.path.join(plots_dir, f"{prefix}_row{i:04d}.png")); plt.close()
+        plt.tight_layout(); plt.savefig(os.path.join(plots_dir, f"{prefix}_row{ridx:04d}.png")); plt.close()
 
 def plot_cls_curves(y_true: torch.Tensor, y_prob: torch.Tensor, tau: float, outdir: str, prefix="after"):
     plots_dir = os.path.join(outdir, "plots"); ensure_outdir(plots_dir)

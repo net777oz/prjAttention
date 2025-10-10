@@ -5,7 +5,7 @@ pipeline.py — Train / Finetune / Infer 오케스트레이션 (다변량 입력
   • data.parse_csv_auto 로 [N,1,T] 또는 [N,C,T] 입력 허용
   • in_channels=C 자동 검출 후 load_model_and_cfg(backbone, in_channels=C)
   • 체크포인트 메타에 in_channels 반영(기존 형식 유지)
-  • 나머지 플로우/모듈 경계는 원본 유지
+  • (중요) 평가/플롯은 검증 행(row)만 사용하도록 고정
 """
 import os, time
 import torch
@@ -56,7 +56,6 @@ def _save_ckpt(model, args, out_path: str):
 
 def _load_ckpt_if_needed(model, args):
     import torch
-    from collections import Counter
     if not args.ckpt:
         raise SystemExit("--ckpt 가 필요합니다.")
     raw = None
@@ -85,7 +84,7 @@ def _load_ckpt_if_needed(model, args):
     print(f"[INFO] ckpt intersect={len(intersect)} / model={len(msd)} missing={len(miss)} unexpected={len(unexp)}", flush=True)
 
     if len(intersect) < max(10, len(msd)//2):
-        def tops(keys): 
+        def tops(keys):
             from collections import Counter
             return Counter(k.split('.',1)[0] for k in keys).most_common(5)
         print("[ERROR] Large mismatch between ckpt and current model.")
@@ -122,6 +121,16 @@ def _maybe_fix_context_len(args, T: int):
         print(f"ATN [WARN] context_len({args.context_len}) < 1 → auto-set to 1", flush=True)
         args.context_len = 1
 
+def _rows_from_indices(groups: torch.Tensor, idx_list: List[int]) -> List[int]:
+    """윈도우 인덱스 → 원본 행(row) 인덱스 집합"""
+    if not isinstance(groups, torch.Tensor):
+        groups = torch.as_tensor(groups)
+    if len(idx_list) == 0:
+        return []
+    sel = groups[torch.as_tensor(idx_list, dtype=torch.long)]
+    rows = torch.unique(sel).cpu().tolist()
+    return sorted(int(r) for r in rows)
+
 # ===== 메인 =====
 def main_run(args):
     set_seed(args.seed)
@@ -155,21 +164,45 @@ def main_run(args):
         flush=True,
     )
 
-    # 2) finetune/infer이면 먼저 ckpt 로드
+    # 2) finetune/infer이면 ckpt 로드
     if args.mode in ("finetune", "infer"):
         _load_ckpt_if_needed(model, args)
 
     # 3) compile 적용(필요 시)
     model, compiled_mode = _maybe_compile(model, args)
 
+    # ---- 공통 전처리: 윈도우/스플릿 준비 (BEFORE/AFTER에서 동일 사용) ----
+    Xw_all, Yw_next, groups, W = build_windows_dataset(X, args.context_len)
+    if args.task == "regress":
+        Yw_all = Yw_next
+    else:
+        if args.bin_rule == "nonzero":
+            Yw_all = (Yw_next != 0).float()
+        elif args.bin_rule == "gt":
+            Yw_all = (Yw_next > args.bin_thr).float()
+        else:
+            Yw_all = (Yw_next >= args.bin_thr).float()
+
+    trn_idx, val_idx = make_splits(
+        Xw_all, Yw_all, groups, N, T, args.context_len, W,
+        args.split_mode, args.val_ratio, args.seed
+    )
+    print(f"[INFO] split={args.split_mode} train_windows={len(trn_idx)} val_windows={len(val_idx)}", flush=True)
+
+    # ★ 행(row) 기준 검증/학습 집합 복원
+    val_rows = _rows_from_indices(groups, val_idx)
+    trn_rows = _rows_from_indices(groups, trn_idx)
+    X_val_rows = X[val_rows] if len(val_rows) else X[:0]
+    X_trn_rows = X[trn_rows] if len(trn_rows) else X[:0]
+    print(f"[CHECK] rows.train={len(trn_rows)} rows.val={len(val_rows)}", flush=True)
+
     # ---- INFER ----
     if args.mode == "infer":
+        # 추론은 전체 X 대상(요구사항 그대로 유지)
         if args.task == "regress":
             bmse, bmae, _, _ = eval_model(model, X, args.context_len, desc="infer", task="regress")
             print(f"[INFER] MSE={bmse:.6f} MAE={bmae:.6f}", flush=True)
             plot_samples(model, X, args.context_len, out_dir, k=args.plot_samples, prefix="infer")
-            with open(os.path.join(out_dir, "infer_report.txt"), "w", encoding="utf-8") as f:
-                f.write(f"infer MSE {bmse:.6f} MAE {bmae:.6f}\n")
         else:
             _, _, ytrue, yprob = eval_model(
                 model, X, args.context_len, desc="infer",
@@ -185,12 +218,6 @@ def main_run(args):
                     f"(MSE={rep['MSE']:.6f}, MAE={rep['MAE']:.6f})",
                     flush=True,
                 )
-                with open(os.path.join(out_dir, "infer_report.txt"), "w", encoding="utf-8") as f:
-                    f.write(
-                        f"τ {rep['threshold']:.3f} F1 {rep['F1']:.6f} Acc {rep['Accuracy']:.6f} "
-                        f"P {rep['Precision']:.6f} R {rep['Recall']:.6f} "
-                        f"MSE {rep['MSE']:.6f} MAE {rep['MAE']:.6f}\n"
-                    )
                 plot_cls_curves(ytrue, yprob, args.thresh_default, out_dir, prefix="infer")
         _save_ckpt(model, args, os.path.join(out_dir, "model.pt"))
         print(f"[DONE] infer saved to {out_dir}", flush=True)
@@ -198,49 +225,27 @@ def main_run(args):
 
     # ---- TRAIN/FINETUNE ----
 
-    # BEFORE eval
-    print("[INFO] starting BEFORE eval...", flush=True)
+    # BEFORE eval (★ 이제 '검증 행' 기준으로만)
+    print("[INFO] starting BEFORE eval (on VAL rows)...", flush=True)
     if args.task == "regress":
-        bmse, bmae, _, _ = eval_model(model, X, args.context_len, desc="before", task="regress")
-        print(f"[BEFORE] MSE={bmse:.6f} MAE={bmae:.6f}", flush=True)
+        bmse, bmae, _, _ = eval_model(model, X_val_rows, args.context_len, desc="before", task="regress")
+        print(f"[BEFORE] (val) MSE={bmse:.6f} MAE={bmae:.6f}", flush=True)
     else:
         _, _, ytrue_b, yprob_b = eval_model(
-            model, X, args.context_len, desc="before",
+            model, X_val_rows, args.context_len, desc="before",
             task="classify", bin_rule=args.bin_rule, bin_thr=args.bin_thr,
             tau_for_cls=args.thresh_default
         )
         if yprob_b is not None and yprob_b.numel():
             rep_b = metrics_from_probs(ytrue_b, yprob_b, threshold=args.thresh_default)
             print(
-                f"[BEFORE-CLS] τ={rep_b['threshold']:.3f} | "
+                f"[BEFORE-CLS] (val) τ={rep_b['threshold']:.3f} | "
                 f"F1={rep_b['F1']:.6f} Acc={rep_b['Accuracy']:.6f} "
                 f"P={rep_b['Precision']:.6f} R={rep_b['Recall']:.6f} "
                 f"(MSE={rep_b['MSE']:.6f}, MAE={rep_b['MAE']:.6f})",
                 flush=True,
             )
-            plot_cls_curves(ytrue_b, yprob_b, args.thresh_default, out_dir, prefix="before")
-
-    # 윈도우 & (분류) 타깃 변환
-    Xw_all, Yw_next, groups, W = build_windows_dataset(X, args.context_len)
-    if args.task == "regress":
-        Yw_all = Yw_next
-    else:
-        if args.bin_rule == "nonzero":
-            Yw_all = (Yw_next != 0).float()
-        elif args.bin_rule == "gt":
-            Yw_all = (Yw_next > args.bin_thr).float()
-        else:
-            Yw_all = (Yw_next >= args.bin_thr).float()
-
-    # split
-    trn_idx, val_idx = make_splits(
-        Xw_all, Yw_all, groups, N, T, args.context_len, W,
-        args.split_mode, args.val_ratio, args.seed
-    )
-    print(
-        f"[INFO] split={args.split_mode} train_windows={len(trn_idx)} val_windows={len(val_idx)}",
-        flush=True,
-    )
+            plot_cls_curves(ytrue_b, yprob_b, args.thresh_default, out_dir, prefix="before_val")
 
     # DataLoader
     from torch.utils.data import TensorDataset, DataLoader, Subset
@@ -281,16 +286,17 @@ def main_run(args):
     )
     plot_training_curve(loss_hist, out_dir, title="Training Loss")
 
-    # AFTER eval + (분류) τ 선택
-    print("[INFO] starting AFTER eval...", flush=True)
+    # AFTER eval + (분류) τ 선택  — ★ 전부 '검증 행' 기준
+    print("[INFO] starting AFTER eval (on VAL rows)...", flush=True)
     if args.task == "regress":
-        amse, amae, _, _ = eval_model(model, X, args.context_len, desc="after", task="regress")
-        print(f"[AFTER ] MSE={amse:.6f} MAE={amae:.6f}", flush=True)
+        amse, amae, _, _ = eval_model(model, X_val_rows, args.context_len, desc="after", task="regress")
+        print(f"[AFTER ] (val) MSE={amse:.6f} MAE={amae:.6f}", flush=True)
         with open(os.path.join(out_dir, "train_report.txt"), "w", encoding="utf-8") as f:
-            f.write(f"before MSE {bmse:.6f} MAE {bmae:.6f}\n")
-            f.write(f"after  MSE {amse:.6f} MAE {amae:.6f}\n")
-        plot_samples(model, X, args.context_len, out_dir, k=args.plot_samples, prefix="after")
+            f.write(f"before(val) MSE {bmse:.6f} MAE {bmae:.6f}\n")
+            f.write(f"after (val) MSE {amse:.6f} MAE {amae:.6f}\n")
+        plot_samples(model, X_val_rows, args.context_len, out_dir, k=args.plot_samples, prefix="after_val")
     else:
+        # τ 선택은 이미 'val windows(vl)'로 수행
         probs_chunks, yv_chunks = [], []
         with torch.no_grad():
             for xb, yb in vl:
@@ -311,14 +317,15 @@ def main_run(args):
             tau, f1_at_tau = args.thresh_default, float("nan")
             print("[WARN] 검증 분할이 없어 τ 기본값을 사용합니다.", flush=True)
 
-        _, _, ytrue_all, yprob_all = eval_model(
-            model, X, args.context_len, desc="after",
+        # AFTER 리포트/플롯도 '검증 행'만
+        _, _, ytrue_val, yprob_val = eval_model(
+            model, X_val_rows, args.context_len, desc="after",
             task="classify", bin_rule=args.bin_rule, bin_thr=args.bin_thr,
             tau_for_cls=tau
         )
-        rep = metrics_from_probs(ytrue_all, yprob_all, threshold=tau)
+        rep = metrics_from_probs(ytrue_val, yprob_val, threshold=tau)
         print(
-            f"[AFTER-CLS] Selected τ={rep['threshold']:.3f} | "
+            f"[AFTER-CLS] (val) τ={rep['threshold']:.3f} | "
             f"F1={rep['F1']:.6f} Acc={rep['Accuracy']:.6f} "
             f"P={rep['Precision']:.6f} R={rep['Recall']:.6f} "
             f"(MSE={rep['MSE']:.6f}, MAE={rep['MAE']:.6f})",
@@ -326,9 +333,10 @@ def main_run(args):
         )
         with open(os.path.join(out_dir, "train_report.txt"), "w", encoding="utf-8") as f:
             f.write(f"tau {rep['threshold']:.3f}\n")
-            f.write(f"F1 {rep['F1']:.6f} Acc {rep['Accuracy']:.6f} P {rep['Precision']:.6f} R {rep['Recall']:.6f}\n")
+            f.write(f"(val) F1 {rep['F1']:.6f} Acc {rep['Accuracy']:.6f} "
+                    f"P {rep['Precision']:.6f} R {rep['Recall']:.6f}\n")
             f.write(f"(ref) MSE {rep['MSE']:.6f} MAE {rep['MAE']:.6f}\n")
-        plot_cls_curves(ytrue_all, yprob_all, rep["threshold"], out_dir, prefix="after")
+        plot_cls_curves(ytrue_val, yprob_val, rep["threshold"], out_dir, prefix="after_val")
 
     # 표준 저장 (메타에 in_channels 포함)
     _save_ckpt(model, args, os.path.join(out_dir, "model.pt"))

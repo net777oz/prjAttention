@@ -3,12 +3,15 @@
 cli.py — 명령행 인터페이스 (다변량 CSV 지원)
 - 변경점:
   • --csv 를 단일/다중 경로 모두 수용(nargs='+')
+  • 평가/플롯 스플릿 제어 플래그 추가 (--eval-split, --plot-split)
   • 나머지 인자/기본값/흐름은 동일
 [의존] pipeline.main_run
 [제공] main()
 """
-import argparse, torch
+import argparse
+import torch
 from pipeline import main_run
+
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
@@ -19,14 +22,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # 모드/작업/모델/학습/출력
-    ap.add_argument("--mode", type=str, required=True, choices=["train","finetune","infer"])
-    ap.add_argument("--task", type=str, default="regress", choices=["regress","classify"])
+    ap.add_argument("--mode", type=str, required=True, choices=["train", "finetune", "infer"])
+    ap.add_argument("--task", type=str, default="regress", choices=["regress", "classify"])
     ap.add_argument("--backbone", type=str, default="llm_ts")
     ap.add_argument("--context-len", type=int, required=True)
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--weight-decay", type=float, default=0.01)
-    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
     ap.add_argument("--seed", type=int, default=777)
     ap.add_argument("--out", type=str, default=None)
     ap.add_argument("--plot-samples", type=int, default=3)
@@ -34,10 +37,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     # 분류 전용
     ap.add_argument("--alpha", type=float, default=0.5)
-    ap.add_argument("--pos-weight", type=str, default="global", choices=["global","batch","none"])
+    ap.add_argument("--pos-weight", type=str, default="global", choices=["global", "batch", "none"])
     ap.add_argument("--thresh-default", type=float, default=0.5)
     ap.add_argument("--val-ratio", type=float, default=0.2)
-    ap.add_argument("--bin-rule", type=str, default="nonzero", choices=["nonzero","gt","ge"])
+    ap.add_argument("--bin-rule", type=str, default="nonzero", choices=["nonzero", "gt", "ge"])
     ap.add_argument("--bin-thr", type=float, default=0.0)
 
     # 리소스/성능
@@ -48,11 +51,29 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--eval-batch-size", type=int, default=4096)
 
     # split
-    ap.add_argument("--split-mode", type=str, default="group", choices=["group","item","time","window"])
+    ap.add_argument("--split-mode", type=str, default="group", choices=["group", "item", "time", "window"])
 
     # 체크포인트
     ap.add_argument("--ckpt", type=str, default=None)
+
+    # (신규) 평가/플롯 시 사용할 스플릿 지정: 기본 'val'로 안전 고정
+    ap.add_argument(
+        "--eval-split", type=str, default="val",
+        choices=["val", "train", "all"],
+        help="평가(eval_model) 시 사용할 스플릿 선택 (기본: val)"
+    )
+    ap.add_argument(
+        "--plot-split", type=str, default="val",
+        choices=["val", "train", "all"],
+        help="플롯(plot_samples/plot_cls_curves) 시 사용할 스플릿 선택 (기본: val)"
+    )
+    ap.add_argument(
+        "--no-plots", action="store_true",
+        help="플롯 생성 비활성화"
+    )
+
     return ap
+
 
 def main():
     ap = build_parser()
@@ -61,3 +82,7 @@ def main():
     if isinstance(args.csv, str):
         args.csv = [args.csv]
     main_run(args)
+
+
+if __name__ == "__main__":
+    main()

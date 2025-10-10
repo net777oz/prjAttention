@@ -16,7 +16,6 @@ import torch.nn.functional as F
 
 from utils import USE_RICH, console, build_train_table, fmt_time
 from losses import SoftF1Loss, build_bce, compute_pos_weight_from_labels
-
 from torch import amp as torch_amp
 
 
@@ -43,13 +42,19 @@ def train_all_epochs(
 
     # epochs==0: 학습 스킵
     if epochs <= 0:
+        msg = "[INFO] epochs=0 → training skipped."
         if USE_RICH:
-            print("[INFO] epochs=0 → training skipped.", flush=True)
+            console.print(msg)
+        else:
+            print(msg, flush=True)
         return []
 
     softf1 = SoftF1Loss() if task == "classify" else None
     bce_loss_fn, _pw = (build_bce(pos_weight_mode, dev, global_pos_weight)
                         if task == "classify" else (None, None))
+    # global 모드인 경우 초기 1회만 고정 설정(배치별 덮어쓰기 방지)
+    if task == "classify" and pos_weight_mode == "global" and (global_pos_weight is not None) and (bce_loss_fn is not None):
+        bce_loss_fn.pos_weight = torch.tensor([float(global_pos_weight)], dtype=torch.float32, device=dev)
 
     # Live 패널 초기 렌더
     live = None
@@ -95,9 +100,12 @@ def train_all_epochs(
             )
             live.update(panel)
         else:
+            # 포맷 안정성(손실 NaN일 때도 깨지지 않도록)
+            lc = float(loss_cur) if (loss_cur is not None and np.isfinite(loss_cur)) else float("nan")
+            la = float(loss_avg) if (loss_avg is not None and np.isfinite(loss_avg)) else float("nan")
             print(
                 f"\r[train] ep {ep}/{epochs} batch {bi}/{len(dl)} "
-                f"done {done}/{total_steps} loss={loss_cur:.6f} avg={loss_avg:.6f} "
+                f"done {done}/{total_steps} loss={lc:.6f} avg={la:.6f} "
                 f"lr={lr:.2e} step={avg_step_time:.2f}s ETA={fmt_time(remaining)} "
                 f"mem={int(mem)}MB",
                 end="",
@@ -117,7 +125,9 @@ def train_all_epochs(
                 opt.zero_grad(set_to_none=True)
 
                 if amp_enabled:
-                    with torch_amp.autocast(device_type="cuda", enabled=True):
+                    # 디바이스 자동 인식(cuda/mps/cpu). 혼합정밀은 cuda/mps에서만 켬.
+                    amp_on = (dev.type in ("cuda", "mps"))
+                    with torch_amp.autocast(device_type=dev.type, enabled=amp_on):
                         logits, _ = model(xb)
                         if task == "regress":
                             loss = F.mse_loss(logits, yb)
@@ -158,13 +168,13 @@ def train_all_epochs(
                     loss.backward()
                     opt.step()
 
-                total += loss.item()
+                total += float(loss.item())
                 steps += 1
                 step_counter += 1
                 avg = total / steps
 
                 if (bi % max(1, log_every)) == 0:
-                    update_table(ep, bi, loss.item(), avg, xb.size(0))
+                    update_table(ep, bi, float(loss.item()), avg, xb.size(0))
 
             ep_avg = total / max(1, steps)
             epoch_loss_hist.append(ep_avg)
