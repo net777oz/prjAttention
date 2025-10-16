@@ -6,6 +6,8 @@ pipeline.py — Train / Finetune / Infer 오케스트레이션 (다변량 입력
   • in_channels=C 자동 검출 후 load_model_and_cfg(backbone, in_channels=C)
   • 체크포인트 메타에 in_channels 반영(기존 형식 유지)
   • (중요) 평가/플롯은 검증 행(row)만 사용하도록 고정
+  • (신규) out_dir 확정 직후 AP_OUT_DIR를 내부적으로 고정 → viz/evaler가 동일 런 폴더만 사용
+  • (신규) plot_samples 호출을 viz.py 현재 시그니처로 교체
 """
 import os, time
 import torch
@@ -143,6 +145,9 @@ def main_run(args):
 
     out_dir = make_run_dir(args, DEFAULT_BASE_OUT)
 
+    # ★★★ 핵심: 자동 런 폴더를 내부 공유(사용자 export 불필요)
+    os.environ.setdefault("AP_OUT_DIR", str(out_dir))
+
     # AMP 실제 가용성
     amp_available = bool(args.amp and torch.cuda.is_available() and str(args.device).startswith("cuda"))
 
@@ -202,7 +207,11 @@ def main_run(args):
         if args.task == "regress":
             bmse, bmae, _, _ = eval_model(model, X, args.context_len, desc="infer", task="regress")
             print(f"[INFER] MSE={bmse:.6f} MAE={bmae:.6f}", flush=True)
-            plot_samples(model, X, args.context_len, out_dir, k=args.plot_samples, prefix="infer")
+            # viz.plot_samples (신규 시그니처)
+            try:
+                plot_samples(X, split="infer", max_samples=args.plot_samples, ch=0, title="Infer Samples")
+            except Exception as e:
+                print(f"[WARN] plot_samples failed: {e}", flush=True)
         else:
             _, _, ytrue, yprob = eval_model(
                 model, X, args.context_len, desc="infer",
@@ -218,7 +227,8 @@ def main_run(args):
                     f"(MSE={rep['MSE']:.6f}, MAE={rep['MAE']:.6f})",
                     flush=True,
                 )
-                plot_cls_curves(ytrue, yprob, args.thresh_default, out_dir, prefix="infer")
+                # 레거시 호환 시그니처도 지원되지만, 신규 방식으로 호출
+                plot_cls_curves(ytrue, yprob, split="infer", tau=args.thresh_default)
         _save_ckpt(model, args, os.path.join(out_dir, "model.pt"))
         print(f"[DONE] infer saved to {out_dir}", flush=True)
         return
@@ -245,7 +255,8 @@ def main_run(args):
                 f"(MSE={rep_b['MSE']:.6f}, MAE={rep_b['MAE']:.6f})",
                 flush=True,
             )
-            plot_cls_curves(ytrue_b, yprob_b, args.thresh_default, out_dir, prefix="before_val")
+            # 레거시 인자(prefix/out_dir) 안 쓰고 신규 호출
+            plot_cls_curves(ytrue_b, yprob_b, split="val", tau=args.thresh_default)
 
     # DataLoader
     from torch.utils.data import TensorDataset, DataLoader, Subset
@@ -284,7 +295,8 @@ def main_run(args):
         task=args.task, alpha=args.alpha,
         pos_weight_mode=args.pos_weight, global_pos_weight=global_pw
     )
-    plot_training_curve(loss_hist, out_dir, title="Training Loss")
+    # 레거시 호출과 호환되지만, 신규 방식 사용
+    plot_training_curve(loss_hist, split="val", title="Training Loss")
 
     # AFTER eval + (분류) τ 선택  — ★ 전부 '검증 행' 기준
     print("[INFO] starting AFTER eval (on VAL rows)...", flush=True)
@@ -294,7 +306,11 @@ def main_run(args):
         with open(os.path.join(out_dir, "train_report.txt"), "w", encoding="utf-8") as f:
             f.write(f"before(val) MSE {bmse:.6f} MAE {bmae:.6f}\n")
             f.write(f"after (val) MSE {amse:.6f} MAE {amae:.6f}\n")
-        plot_samples(model, X_val_rows, args.context_len, out_dir, k=args.plot_samples, prefix="after_val")
+        # viz.plot_samples (신규 시그니처)
+        try:
+            plot_samples(X_val_rows, split="val", max_samples=args.plot_samples, ch=0, title="After (val) Samples")
+        except Exception as e:
+            print(f"[WARN] plot_samples failed: {e}", flush=True)
     else:
         # τ 선택은 'val windows(vl)'로 수행하되, 확률은 ch0만 사용
         probs_chunks, yv_chunks = [], []
@@ -320,12 +336,8 @@ def main_run(args):
         if probs_chunks:
             probs_val = torch.cat(probs_chunks, dim=0).view(-1).float()
             y_val = torch.cat(yv_chunks, dim=0).view(-1).float()
-
-            # ---------------- [FIX] 길이 일치 가드 ----------------
             assert probs_val.numel() == y_val.numel(), \
                 f"probs({probs_val.numel()}) vs labels({y_val.numel()}) length mismatch"
-            # -----------------------------------------------------
-
             tau, f1_at_tau = find_best_threshold_for_f1(y_val, probs_val, step=0.001)
         else:
             tau, f1_at_tau = args.thresh_default, float("nan")
@@ -350,7 +362,8 @@ def main_run(args):
             f.write(f"(val) F1 {rep['F1']:.6f} Acc {rep['Accuracy']:.6f} "
                     f"P {rep['Precision']:.6f} R {rep['Recall']:.6f}\n")
             f.write(f"(ref) MSE {rep['MSE']:.6f} MAE {rep['MAE']:.6f}\n")
-        plot_cls_curves(ytrue_val, yprob_val, rep["threshold"], out_dir, prefix="after_val")
+        # 레거시 인자(prefix/out_dir) 안 쓰고 신규 호출
+        plot_cls_curves(ytrue_val, yprob_val, split="val", tau=rep["threshold"])
 
     # 표준 저장 (메타에 in_channels 포함)
     _save_ckpt(model, args, os.path.join(out_dir, "model.pt"))

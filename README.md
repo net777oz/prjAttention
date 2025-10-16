@@ -1,87 +1,31 @@
-# 🧠 AttentionProject
+🧠 AttentionProject
+
 LLM-style Time-Series Forecasting & Classification Framework
 
-## 📘 개요
-AttentionProject는 시계열 데이터를 Transformer/LLM 방식으로 처리하는 모듈형 파이프라인입니다.  
-데이터 로드 → 윈도우 생성 → 모델 로드 → 학습/추론 → 리포트 & 플롯까지 자동화하며, **단일 CSV**는 물론 **다변량(Multi-CSV)** 입력을 지원합니다.
+데이터 로드 → 윈도우 구성 → 학습/추론 → 아티팩트 자동 저장 → HTML 리포트까지 한 번에.
 
-> **중요 변경점(업데이트)**
-> - `viz.py`, `evaler.py`가 넘겨받은 텐서만 사용하도록 명확화. 기본 동작은 변경 없음.
-> - **CLI에 스플릿 제어 플래그 추가**: `--eval-split`, `--plot-split` (기본값 `val`).  
->   학습 중 평가/플롯이 **검증셋만** 사용되도록 기본을 안전하게 고정했습니다.
-> - `trainer.py` AMP 자동화(디바이스 인식), 분류 pos_weight 글로벌 설정 안정화.
+🔔 이번 업데이트 핵심
 
----
+evaler.py 드롭-인 교체
 
-## 🧩 주요 구성요소
-| 파일 | 설명 |
-|---|---|
-| `run_llmts.py` | 런처(엔트리). 내부에서 `cli.main()` 호출 |
-| `cli.py` | 명령행 인자 파서(스플릿 제어 플래그 포함) |
-| `pipeline.py` | 전체 오케스트레이션(데이터 로드 → 학습/추론 → 리포트 저장) |
-| `data.py` | CSV 파싱, 텐서 변환, 시드 고정, 출력 경로 생성 |
-| `windows.py` | 슬라이딩 윈도우 데이터셋 생성 |
-| `splits.py` | 학습/검증 분할 로직 |
-| `trainer.py` | 학습 루프(AMP/torch.compile 대응, 분류 하이브리드 손실) |
-| `evaler.py` | 평가(회귀/분류 공용, OOM-안전, 선택 인덱스 지원) |
-| `metrics.py` | F1, Accuracy, MAE, MSE 등 |
-| `viz.py` | 손실 곡선, ROC/PR, F1-τ, Confusion, Prob-Hist, 샘플 플롯 |
+분류: preds.csv, metrics.json, ROC/PR/히스토그램 자동 저장
 
----
+회귀: summary.json 및 잔차/산점도 자동 저장
 
-## 🧮 입력 구조
-### 단변량 (기존)
-- 입력 CSV 1개: `shape [N, T]` → 자동으로 ` [N, 1, T]`
-```bash
---csv ./data/SPa.csv
-다변량 (Multi-CSV)
-입력 CSV 여러 개: 각 파일 shape [N, T] 동일 → 자동으로 [N, C, T] (C=파일 수)
+저장 경로: ./artifacts/llm_ts_eval/<tag>/ (<tag> = split_name 또는 desc)
 
-타깃은 항상 채널 0(첫 번째 CSV) 의 다음 스텝입니다. 나머지 채널은 보조 피처로 사용됩니다.
+리포트 생성기 tools/report_artifacts.py
 
-bash
-코드 복사
---csv ./data/x_main.csv ./data/x_aux1.csv ./data/x_aux2.csv
-⚙️ 공통 인자 요약
-인자	설명	기본값
---mode	train / finetune / infer	(필수)
---task	regress / classify	regress
---backbone	백본 이름	llm_ts
---context-len	윈도우 길이	(필수)
---epochs	학습 반복 횟수	1
---batch-size	배치 크기	4096
---lr / --weight-decay	최적화 하이퍼파라미터	2e-4 / 0.01
---device	cuda/cpu 자동선택	(환경 감지)
---seed	시드	777
---out	출력 디렉터리(없으면 자동 생성)	None
---plot-samples	샘플 플롯 개수	3
---log-every	로그 주기(미니배치)	50
-분류 전용		
---alpha	BCE vs SoftF1 혼합 가중치	0.5
---pos-weight	양성 가중치 방식 (global/batch/none)	global
---thresh-default	기본 임계값(τ)	0.5
---val-ratio	검증 비율	0.2
---bin-rule	타깃 이진화 규칙 (nonzero/gt/ge)	nonzero
---bin-thr	이진화 기준값	0.0
-리소스/성능		
---num-workers	DataLoader 워커 수	4
---amp	자동 혼합정밀(가능한 디바이스에서만 활성)	False
---compile	torch.compile 모드 ("", reduce-overhead, max-autotune)	""
---eval-batch-size	평가 배치 크기	4096
-스플릿 제어(신규)		
---split-mode	group / item / time / window	group
---eval-split	평가에 사용할 스플릿 (val/train/all)	val
---plot-split	플롯에 사용할 스플릿 (val/train/all)	val
---no-plots	플롯 생성 비활성화	False
-체크포인트		
---ckpt	불러올 모델 경로	None
+artifacts/ 하위 실험 폴더를 훑어 단일 HTML 리포트(검색/정렬/필터) 생성
 
---eval-split/--plot-split 기본값을 val로 고정하여, 학습 중 평가/플롯이 전체 데이터가 아닌 검증셋에 대해서만 수행되도록 했습니다. 필요 시 all 또는 train으로 변경하세요.
+지표 생성 도구
 
-🚀 실행 예제
-🧠 Training (분류)
-bash
-코드 복사
+tools/metrics_writer.py: 코드 내에서 즉시 metrics.json 저장
+
+tools/make_metrics_json.py: 과거 preds.csv/.npy/.npz로 사후 metrics.json 생성
+
+🚀 빠른 시작 (명령만 보면 되는 섹션)
+1) 학습(분류)
 python run_llmts.py --mode train --task classify \
   --csv ./data/x_main.csv ./data/x_aux1.csv ./data/x_aux2.csv \
   --context-len 31 --epochs 30 --batch-size 4096 \
@@ -90,19 +34,8 @@ python run_llmts.py --mode train --task classify \
   --split-mode group --val-ratio 0.2 \
   --eval-split val --plot-split val \
   --amp --compile reduce-overhead
-입력: [N,3,T] (다변량), 타깃=첫 CSV(채널 0)
 
-출력 폴더(예): artifacts/train_classify_ctx31_ch3_*
-
-model.pt
-
-train_report.txt
-
-plots/
-
-🔧 Finetune
-bash
-코드 복사
+2) 파인튜닝
 python run_llmts.py --mode finetune --task classify \
   --csv ./data/x_main.csv ./data/x_aux1.csv ./data/x_aux2.csv \
   --context-len 31 --epochs 10 --batch-size 4096 \
@@ -112,64 +45,169 @@ python run_llmts.py --mode finetune --task classify \
   --ckpt ./artifacts/train_classify_ctx31_ch3_alpha0.50_pwglobal_llm_ts_seed777_splitgroup/model.pt \
   --eval-split val --plot-split val \
   --amp --compile reduce-overhead
-🔍 Inference
-bash
-코드 복사
+
+3) 추론(infer)
 python run_llmts.py --mode infer --task classify \
   --csv ./data/x_main.csv ./data/x_aux1.csv ./data/x_aux2.csv \
   --context-len 31 \
   --ckpt ./artifacts/train_classify_ctx31_ch3_alpha0.50_pwglobal_llm_ts_seed777_splitgroup/model.pt \
   --eval-split val --plot-split val \
   --amp --compile reduce-overhead
-출력:
 
-infer_report.txt (F1 / Acc / Precision / Recall / MSE / MAE)
 
-plots/ (ROC/PR, F1-τ, Confusion, Prob-Hist 등)
+라벨 없는 추론이라면 지표/곡선은 생성되지 않습니다(확률/예측만 파일로 남을 수 있음).
 
-필요 시 model.pt 갱신(메타 포함)
+🧩 주요 기능 요약
+데이터 입력
 
-🧾 출력 구조
-파일/폴더	설명
-model.pt	state_dict + 메타 정보
-train_report.txt	학습 성능 지표(Before/After 포함 시)
-infer_report.txt	추론 결과 리포트
-plots/	손실 곡선, 분류 곡선(PR/ROC), 히스토그램, Confusion, 샘플 플롯
+단변량: CSV 1개 → 자동으로 [N, 1, T]
 
-⚡ 성능 최적화 팁
-Tensor Core(Ampere+)에서 속도 향상을 원하시면 시작부에 아래를 권장합니다:
+다변량(Multi-CSV): CSV 여러 개 → 자동으로 [N, C, T] (C=파일 수)
+타깃은 항상 채널 0(첫 번째 CSV) 다음 스텝입니다.
 
-python
-코드 복사
+스플릿 제어(안전 기본값)
+
+--eval-split val, --plot-split val이 기본 → 학습 중 평가/플롯은 검증셋 기준
+필요 시 train/all로 변경하세요.
+
+성능/자원
+
+--amp(가능한 디바이스에서만 자동 활성), --compile reduce-overhead|max-autotune 지원
+
+대규모 시계열에 맞춘 OOM-안전 롤링 윈도우 평가
+
+🗂️ 아티팩트(자동 저장)
+저장 구조(기본)
+artifacts/
+├── llm_ts_eval/
+│   └── <tag>/                   # <tag> = split_name or desc
+│       ├── (분류) metrics.json, preds.csv, roc.png, pr.png, hist_*.png
+│       └── (회귀) summary.json, resid_hist.png, pred_vs_true.png
+└── report/
+    ├── index.html               # 리포트
+    ├── style.css
+    └── app.js
+
+evaler.py가 언제 실행됨?
+
+train/finetune 중 검증 단계 및 학습 종료 후 최종 평가
+
+infer 모드:
+
+라벨이 있으면 → 분류/회귀 지표 및 플롯, metrics.json/summary.json 생성
+
+라벨이 없으면 → 순수 추론(지표/곡선 생략)
+
+📊 HTML 리포트 생성 (tools/report_artifacts.py)
+실행
+python tools/report_artifacts.py \
+  --artifacts ./artifacts \
+  --out ./artifacts/report/index.html \
+  --max-images 24 \
+  --sort-key f1 \
+  --sort-by-score \
+  --verbose
+
+특징
+
+자동 스캔: artifacts/ 하위의 지표(JSON)와 그래프 이미지 모아 단일 HTML
+
+간단 분석 포함: F1/Precision/Recall/AUPRC/AUROC/Accuracy/Threshold 패턴으로 한 줄 코멘트
+
+검색/정렬/필터: 실험명 검색, 최소 스코어, score-key 필터, 최신순/스코어순 정렬
+
+가벼움: 이미지 Base64 미사용(상대경로 링크) → 용량 최소화
+
+JSON이 없어도 이미지만 있는 폴더는 카드가 표시됩니다.
+경로 계산은 자동(리포트 위치와 무관)이며, 문제 시 --verbose로 원인을 확인하세요.
+
+🧾 지표 생성 도구 (선택)
+1) 실시간 저장 모듈 (tools/metrics_writer.py)
+
+평가 루틴에서 바로 호출하여 metrics.json(+옵션 preds.csv) 저장
+
+ROC-AUC/PR-AUC, default/best τ, confusion, prevalence 등을 포함
+
+사용처: 커스텀 평가코드/외부 러너에서 즉시 지표 파일을 만들고 싶을 때
+
+2) 사후 소급 CLI (tools/make_metrics_json.py)
+
+과거 실험의 preds.csv/.npy/.npz로 나중에 metrics.json 생성
+
+컬럼 자동 탐색:
+
+y_true: y_true,label,labels,target,y,gt,truth
+
+y_score: y_score,prob,proba,pred_proba,score,p,y_prob
+
+실행 예시
+# CSV → metrics.json
+python tools/make_metrics_json.py \
+  --in ./artifacts/llm_ts_eval/val/preds.csv \
+  --outdir ./artifacts/llm_ts_eval/val \
+  --save-preds
+
+# NPY/NPZ → metrics.json (dict or (y_true, y_score))
+python tools/make_metrics_json.py \
+  --in ./artifacts/old_run/preds.npy \
+  --outdir ./artifacts/old_run
+
+⚙️ 자주 쓰는 주요 인자 (요약)
+
+공통
+
+--mode {train,finetune,infer}
+
+--task {regress,classify}
+
+--context-len <int> (필수)
+
+--batch-size, --epochs, --lr, --weight-decay, --device, --seed
+
+--split-mode {group,item,time,window}, --val-ratio <float>
+
+--eval-split {val,train,all}, --plot-split {val,train,all}, --no-plots
+
+--amp, --compile {,reduce-overhead,max-autotune}
+
+분류 전용
+
+--alpha (BCE vs SoftF1 혼합 가중치)
+
+--pos-weight {global,batch,none}
+
+--bin-rule {nonzero,gt,ge}, --bin-thr <float>
+
+--thresh-default <float> (기본 임계값 τ)
+
+🆘 트러블슈팅
+
+리포트에 카드가 안 보임
+
+폴더에 이미지나 JSON이 없는 경우일 수 있습니다.
+
+평가가 실제로 돌았는지(evaler.py가 artifacts/llm_ts_eval/<tag>/… 파일 생성했는지) 확인하세요.
+
+과거 실험이면 tools/make_metrics_json.py로 metrics.json을 소급 생성.
+
+이미지가 깨짐
+
+--out / --artifacts 경로가 달라도 상대경로를 자동 계산합니다.
+
+권한/경로 문제는 --verbose로 콘솔 로그 확인.
+
+라벨 없는 추론(Infer)
+
+y_true가 없으면 지표/곡선은 생성되지 않습니다(의도된 동작).
+
+확률/예측만 필요하면 OK, 지표가 필요하면 라벨이 있는 평가 루틴으로 돌리세요.
+
+📌 팁
+
+Ampere+ GPU면 시작부에 아래 설정을 권장합니다(가속 기대):
+
 import torch
 torch.set_float32_matmul_precision("high")
-nn.Linear, Attention 등에서 FP32→TF32 텐서코어 사용으로 20~40% 가속 기대
 
---amp는 CUDA/MPS 등 가능한 디바이스에서만 활성화됩니다. CPU에서는 자동으로 비활성.
 
-📁 프로젝트 구조
-markdown
-코드 복사
-prjAttention/
-├── run_llmts.py
-├── cli.py
-├── pipeline.py
-├── data.py
-├── windows.py
-├── splits.py
-├── trainer.py
-├── evaler.py
-├── metrics.py
-├── viz.py
-├── ttm_flow/
-│   ├── __init__.py
-│   ├── model.py
-│   └── ...
-└── artifacts/
-    └── (자동생성)
-🧩 모드 요약
-모드	설명	주요 출력
-train	새 모델 학습	model.pt, train_report.txt, plots/
-finetune	기존 모델 이어 학습	동일 폴더 내 재저장
-infer	추론 및 리포트	infer_report.txt, plots/
-
+--amp는 CUDA/MPS 등에서만 활성, CPU 환경은 자동 비활성.

@@ -11,16 +11,15 @@ Split Leakage Checker for AttentionProject
 지원 모드:
 1) groups.csv 한 개만 있을 때(분할 전 데이터):
    - --split-mode group, --val-ratio, --seed 로 동일 규칙으로 "예상 분할"을 재현하여
-     (train_units, val_units)를 산출하고 교집합이 비어있는지 확인합니다.
-   - 주의: 실제 학습 코드의 분할 알고리즘과 seed가 동일해야 재현이 정확합니다.
+     (train_units, val_units)를 산출하고 교집합이 비어있는지 확인.
 
 2) 분할 결과 유닛 목록이 따로 있을 때:
    - --train-units 파일, --val-units 파일(각각 한 줄당 정수 unit_id)
-     → 두 집합의 교집합이 비어있는지 직접 검증합니다.
+     → 두 집합의 교집합을 직접 검증.
 
 3) 폴더별 groups.csv 두 개가 있을 때:
    - --train-groups, --val-groups 로 각 폴더의 groups.csv를 지정
-     → 두 폴더의 유닛 교집합을 직접 검증합니다.
+     → 두 폴더의 유닛 교집합을 직접 검증.
 """
 
 import argparse
@@ -31,7 +30,7 @@ import random
 
 def read_groups_csv(path):
     """
-    groups.csv 형식: row_idx,unit_id,valid_len
+    groups.csv 형식: row_idx,unit_id,valid_len(, ...optional)
     """
     units = []
     with open(path, "r", encoding="utf-8") as f:
@@ -43,7 +42,7 @@ def read_groups_csv(path):
             try:
                 unit_id = int(row[1])
             except Exception:
-                # 혹시 헤더가 있는 다른 형식일 경우 스킵
+                # 헤더/이상행은 스킵
                 continue
             units.append(unit_id)
     return units
@@ -63,7 +62,7 @@ def read_units_list(path):
 
 def derive_group_split(units, val_ratio=0.2, seed=777):
     """
-    units: [unit_id,...] (중복 없이)
+    units: [unit_id,...] (중복 허용 입력 → 내부에서 set)
     단순 셔플 후 앞쪽을 val로, 나머지를 train으로.
     (학습 코드가 동일 규칙을 쓴다는 가정하에 재현 가능)
     """
@@ -76,13 +75,14 @@ def derive_group_split(units, val_ratio=0.2, seed=777):
     train_units = set(uniq[val_n:])
     return train_units, val_units
 
-def summarize(train_units, val_units, label_train="train", label_val="val"):
+def summarize(train_units, val_units, label_train="train", label_val="val", show_overlap=20):
     inter = train_units & val_units
     print(f"[INFO] {label_train} units: {len(train_units)}")
     print(f"[INFO] {label_val}   units: {len(val_units)}")
     print(f"[CHECK] intersection({label_train} ∩ {label_val}) = {len(inter)}")
     if inter:
-        print(f"[ALERT] Leakage suspected! Sample overlaps (up to 20 shown): {sorted(list(inter))[:20]}")
+        sample = sorted(list(inter))[:show_overlap]
+        print(f"[ALERT] Leakage suspected! Sample overlaps (up to {show_overlap}): {sample}")
     else:
         print("[OK] No unit overlap detected.")
 
@@ -92,7 +92,7 @@ def main():
     ap.add_argument("--groups", type=str, help="분할 전 데이터의 groups.csv 경로")
     ap.add_argument("--split-mode", type=str, default="group",
                     choices=["group","item","time","window"],
-                    help="스플릿 모드(재현용). 현재는 group만 안전하게 재현 권장.")
+                    help="스플릿 모드(재현용). 현재는 group만 신뢰 가능.")
     ap.add_argument("--val-ratio", type=float, default=0.2, help="검증 비율 (재현용)")
     ap.add_argument("--seed", type=int, default=777, help="재현용 시드")
 
@@ -104,28 +104,31 @@ def main():
     ap.add_argument("--train-groups", type=str, help="train 폴더의 groups.csv 경로")
     ap.add_argument("--val-groups", type=str, help="val 폴더의 groups.csv 경로")
 
+    # 표시 옵션
+    ap.add_argument("--show-overlap", type=int, default=20, help="교집합 샘플 표시 개수")
     args = ap.parse_args()
 
     # 우선순위: (2) → (3) → (1)
     if args.train_units and args.val_units:
         tr = read_units_list(args.train_units)
         va = read_units_list(args.val_units)
-        summarize(tr, va, "train(file)", "val(file)")
+        summarize(tr, va, "train(file)", "val(file)", args.show_overlap)
         return
 
     if args.train_groups and args.val_groups:
         tr = set(read_groups_csv(args.train_groups))
         va = set(read_groups_csv(args.val_groups))
-        summarize(tr, va, "train(groups)", "val(groups)")
+        summarize(tr, va, "train(groups)", "val(groups)", args.show_overlap)
         return
 
     if args.groups:
         if args.split_mode != "group":
-         print("[WARN] 현재 스크립트는 group 분할 재현만 신뢰할 수 있습니다. 다른 모드는 학습 코드와 불일치할 수 있습니다.",
-               file=sys.stderr)
+            print("[WARN] 현재 스크립트는 'group' 분할 재현만 신뢰할 수 있습니다. "
+                  "다른 모드는 학습 코드와 불일치할 수 있습니다.",
+                  file=sys.stderr)
         units = set(read_groups_csv(args.groups))
         tr, va = derive_group_split(list(units), val_ratio=args.val_ratio, seed=args.seed)
-        summarize(tr, va, "train(derived)", "val(derived)")
+        summarize(tr, va, "train(derived)", "val(derived)", args.show_overlap)
         return
 
     print("[ERROR] 실행 모드를 선택하세요.\n"
