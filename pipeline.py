@@ -296,7 +296,7 @@ def main_run(args):
             f.write(f"after (val) MSE {amse:.6f} MAE {amae:.6f}\n")
         plot_samples(model, X_val_rows, args.context_len, out_dir, k=args.plot_samples, prefix="after_val")
     else:
-        # τ 선택은 이미 'val windows(vl)'로 수행
+        # τ 선택은 'val windows(vl)'로 수행하되, 확률은 ch0만 사용
         probs_chunks, yv_chunks = [], []
         with torch.no_grad():
             for xb, yb in vl:
@@ -307,11 +307,25 @@ def main_run(args):
                         logits_b, _ = model(xb)
                 else:
                     logits_b, _ = model(xb)
-                probs_chunks.append(torch.sigmoid(logits_b).detach().cpu())
-                yv_chunks.append(yb.detach().cpu())
+
+                # ---------------- [FIX] ch0 강제 + 1D 보장 ----------------
+                if logits_b.dim() == 2:
+                    logits_b = logits_b[:, 0]          # [B]
+                probs_b = torch.sigmoid(logits_b)       # [B]
+                # ---------------------------------------------------------
+
+                probs_chunks.append(probs_b.detach().cpu())
+                yv_chunks.append(yb.detach().cpu())     # Yw_all은 이미 1D (windows.py 수정 반영)
+
         if probs_chunks:
-            probs_val = torch.cat(probs_chunks, dim=0)
-            y_val = torch.cat(yv_chunks, dim=0)
+            probs_val = torch.cat(probs_chunks, dim=0).view(-1).float()
+            y_val = torch.cat(yv_chunks, dim=0).view(-1).float()
+
+            # ---------------- [FIX] 길이 일치 가드 ----------------
+            assert probs_val.numel() == y_val.numel(), \
+                f"probs({probs_val.numel()}) vs labels({y_val.numel()}) length mismatch"
+            # -----------------------------------------------------
+
             tau, f1_at_tau = find_best_threshold_for_f1(y_val, probs_val, step=0.001)
         else:
             tau, f1_at_tau = args.thresh_default, float("nan")

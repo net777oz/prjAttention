@@ -38,9 +38,6 @@ def eval_model(model,
     반환:
       회귀: (avg_mse, avg_mae, None, None)
       분류: (None, None, y_true_all, y_prob_all)
-
-    indices: 평가할 row 인덱스 서브셋(미지정 시 X 전체 사용)
-    split_name: 로그 표시에 사용할 스플릿 이름(예: "val", "train")
     """
     model.eval()
     dev = next(model.parameters()).device
@@ -55,6 +52,10 @@ def eval_model(model,
     tag = split_name if split_name else desc
     metric_name = "avg MSE" if task == "regress" else f"F1@τ={tau_for_cls:.3f}"
     metric_val = float("nan")
+
+    # 공통 유틸: 2D 텐서는 ch0만 선택
+    def _sel_ch0(t: torch.Tensor) -> torch.Tensor:
+        return t[:, 0] if (hasattr(t, "dim") and t.dim() == 2) else t
 
     def binarize(y_next: torch.Tensor) -> torch.Tensor:
         if bin_rule == "nonzero": return (y_next != 0).float()
@@ -72,21 +73,32 @@ def eval_model(model,
                 if Xw.numel() == 0:
                     continue
                 Xw = Xw.to(dev, non_blocking=True)
+
                 if task == "regress":
-                    Yw = Yw_reg.to(dev, non_blocking=True)
+                    # [FIX] 회귀도 ch0만 타깃으로 계산
+                    Yw = _sel_ch0(Yw_reg).to(dev, non_blocking=True)
                     pred, _ = model(Xw)
+                    pred = _sel_ch0(pred)
+                    # 차원 가드: 회귀에서도 1D 또는 동일 shape 보장
+                    assert pred.shape == Yw.shape, f"pred {tuple(pred.shape)} vs Y {tuple(Yw.shape)}"
                     mse_list.append(F.mse_loss(pred, Yw).item())
                     mae_list.append(F.l1_loss(pred, Yw).item())
                     metric_val = float(np.mean(mse_list)) if mse_list else float("nan")
+
                 else:
-                    Yw_bin = binarize(Yw_reg).to(dev, non_blocking=True)
+                    # [FIX] 분류: 라벨/로짓 ch0만 → 1D
+                    Yw_reg_sel = _sel_ch0(Yw_reg).to(dev, non_blocking=True)
+                    Yw_bin = binarize(Yw_reg_sel)
                     logits, _ = model(Xw)
+                    logits = _sel_ch0(logits)
                     probs = torch.sigmoid(logits)
+                    assert Yw_bin.dim() == 1, f"y_true must be 1D, got {tuple(Yw_bin.shape)}"
+                    assert probs.dim() == 1,  f"y_prob must be 1D, got {tuple(probs.shape)}"
                     prob_buf.append(probs.detach().cpu())
                     true_buf.append(Yw_bin.detach().cpu())
+
                     yprob = torch.cat(prob_buf, dim=0)
                     ytrue = torch.cat(true_buf, dim=0)
-                    # 실시간 표시는 F1만
                     tp = ((yprob>=tau_for_cls).float() * ytrue).sum().item()
                     fp = ((yprob>=tau_for_cls).float() * (1-ytrue)).sum().item()
                     fn = (((yprob<tau_for_cls).float()) * ytrue).sum().item()
@@ -108,15 +120,21 @@ def eval_model(model,
             if Xw.numel() == 0:
                 continue
             Xw = Xw.to(dev, non_blocking=True)
+
             if task == "regress":
-                Yw = Yw_reg.to(dev, non_blocking=True)
+                Yw = _sel_ch0(Yw_reg).to(dev, non_blocking=True)
                 pred, _ = model(Xw)
+                pred = _sel_ch0(pred)
+                assert pred.shape == Yw.shape, f"pred {tuple(pred.shape)} vs Y {tuple(Yw.shape)}"
                 mse_list.append(F.mse_loss(pred, Yw).item())
                 mae_list.append(F.l1_loss(pred, Yw).item())
             else:
-                Yw_bin = binarize(Yw_reg).to(dev, non_blocking=True)
+                Yw_reg_sel = _sel_ch0(Yw_reg).to(dev, non_blocking=True)
+                Yw_bin = binarize(Yw_reg_sel)
                 logits, _ = model(Xw)
+                logits = _sel_ch0(logits)
                 probs = torch.sigmoid(logits)
+                assert Yw_bin.dim() == 1 and probs.dim() == 1
                 prob_buf.append(probs.detach().cpu()); true_buf.append(Yw_bin.detach().cpu())
 
         if task == "regress":

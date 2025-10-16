@@ -38,6 +38,7 @@ def plot_samples(model,
                  indices: Optional[List[int]] = None):
     """
     indices: 플롯에 사용할 row 인덱스 서브셋(미지정 시 앞에서 k개)
+    * 회귀/분류 무관하게, 시계열 샘플은 항상 ch0(첫 CSV) 기준으로 표시
     """
     ensure_outdir(outdir); plots_dir = os.path.join(outdir, "plots"); ensure_outdir(plots_dir)
     model.eval(); dev = next(model.parameters()).device
@@ -49,26 +50,52 @@ def plot_samples(model,
     for j, ridx in enumerate(rows):
         if not (0 <= ridx < N):  # 방어
             continue
-        row = X[ridx]
-        preds = torch.full((C, T), float("nan"))
+        row = X[ridx]  # [C, T]
+        # 예측 타임라인 버퍼 (ch0만 사용)
+        pred_ch0 = np.full((T,), np.nan, dtype=np.float32)
+
         Lc = max(1, min(L, T-1))
-        Xw, _, _, _ = build_windows_dataset(row.unsqueeze(0), Lc)
+        Xw, _, _, _ = build_windows_dataset(row.unsqueeze(0), Lc)  # 단일 row → 윈도우들
         with torch.no_grad():
-            pred, _ = model(Xw.to(dev, non_blocking=True)); pred = pred.cpu()
-        preds[:, Lc:] = pred.T
-        x_np = row.numpy(); p_np = preds.numpy()
+            pred, _ = model(Xw.to(dev, non_blocking=True))  # pred: [T-Lc, C] 또는 [T-Lc]
+            pred = pred.detach().cpu()
+
+        # [FIX] 출력 차원에 상관없이 ch0만 선택
+        if pred.dim() == 2:
+            # [T-Lc, C] → ch0
+            pred_sel = pred[:, 0]
+        elif pred.dim() == 1:
+            # [T-Lc]
+            pred_sel = pred
+        else:
+            # 예상 외 차원은 납작하게 만든 뒤 길이 점검
+            pred_sel = pred.reshape(-1)
+
+        # 길이 가드: 시계열에 배치
+        len_out = pred_sel.shape[0]
+        len_slot = T - Lc
+        use = min(len_out, len_slot)
+        if use > 0:
+            pred_ch0[Lc:Lc+use] = pred_sel[:use].numpy()
+
+        x_np = row.numpy()  # [C,T]
         plt.figure(figsize=(12,4))
-        plt.plot(range(T), x_np[0], linewidth=1.2, label=f"true")
-        m = ~np.isnan(p_np[0])
+        # 진짜값: ch0
+        plt.plot(range(T), x_np[0], linewidth=1.2, label="true")
+        # 예측값: ch0
+        m = ~np.isnan(pred_ch0)
         if m.any():
-            plt.plot(np.arange(T)[m], p_np[0][m], ls="--", linewidth=1.2, label=f"pred")
+            plt.plot(np.arange(T)[m], pred_ch0[m], ls="--", linewidth=1.2, label="pred")
         plt.legend(loc="upper right", fontsize=9)
-        plt.title(f"row {ridx} (context={Lc})")
+        plt.title(f"row {ridx} (context={Lc}) [ch0]")
         plt.xlabel("time (col index)"); plt.ylabel("value")
         plt.tight_layout(); plt.savefig(os.path.join(plots_dir, f"{prefix}_row{ridx:04d}.png")); plt.close()
 
 def plot_cls_curves(y_true: torch.Tensor, y_prob: torch.Tensor, tau: float, outdir: str, prefix="after"):
     plots_dir = os.path.join(outdir, "plots"); ensure_outdir(plots_dir)
+    # [FIX] 1D 강제 가드 (evaler에서 이미 보장하지만 재확인)
+    assert y_true.dim() == 1 and y_prob.dim() == 1, f"plot_cls_curves expects 1D tensors, got {tuple(y_true.shape)}, {tuple(y_prob.shape)}"
+
     yt = y_true.float().view(-1).cpu().numpy()
     yp = y_prob.float().view(-1).cpu().numpy()
 

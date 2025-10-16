@@ -2,9 +2,9 @@
 """
 data.py — 데이터 로딩/출력 경로/시드 (다변량 CSV 지원)
 - 변경점:
-  • parse_csv_single: 단일 CSV → [N,1,T] (기존 유지)
-  • parse_csv_list  : 여러 CSV → [N,C,T] (신규)
-  • parse_csv_auto  : 단일/다중 자동 분기 (신규)
+  • parse_csv_single: 단일 CSV → [N,1,T] (기존 유지, _in_channels/_label_csv 주입)
+  • parse_csv_list  : 여러 CSV → [N,C,T] (순서 보존, _in_channels/_label_csv 주입)
+  • parse_csv_auto  : 단일/다중 자동 분기
   • read_csv_no_header: BOM/헤더 1행 자동 처리
 """
 import os, io, numpy as np, torch
@@ -49,7 +49,12 @@ def parse_csv_single(args) -> torch.Tensor:
     if M.ndim != 2:
         raise SystemExit(f"--csv는 2차원 [N,T] 형태여야 합니다. got shape={tuple(M.shape)}")
     X = M.unsqueeze(1)  # [N,1,T]
-    print(f"[INFO] parse_csv_single: {path} -> {tuple(X.shape)}")
+
+    # 메타 주입: 채널수/라벨 소스
+    setattr(args, "_in_channels", 1)
+    setattr(args, "_label_csv", path)
+    print(f"[INFO] parse_csv_single: {path} -> {tuple(X.shape)} (label from first CSV = ch0)")
+
     return X
 
 def parse_csv_list(args) -> torch.Tensor:
@@ -57,14 +62,24 @@ def parse_csv_list(args) -> torch.Tensor:
     여러 CSV: 각각 [N,T] 를 채널 축(C)으로 스택 → [N,C,T]
     모든 CSV의 [N,T]가 일치해야 함
     """
+    # 리스트/튜플 등 순서 보존 전제: 첫 항목이 라벨 기준(ch0)
     paths = list(args.csv)
+    if len(paths) < 2:
+        raise SystemExit("[data] parse_csv_list requires >=2 CSVs")
     mats = [to_tensor(read_csv_no_header(p)) for p in paths]  # 각 [N,T]
     N0, T0 = mats[0].shape
     for p, m in zip(paths, mats):
         if tuple(m.shape) != (N0, T0):
             raise SystemExit(f"[data] shape mismatch at '{p}': expected {(N0,T0)}, got {tuple(m.shape)}")
+
     X = torch.stack(mats, dim=1)  # [N,C,T]
+
+    # 메타 주입: 채널수/라벨 소스(항상 첫 CSV)
+    setattr(args, "_in_channels", len(paths))
+    setattr(args, "_label_csv", paths[0])
+
     print(f"[INFO] parse_csv_list: {len(paths)} files -> {tuple(X.shape)}")
+    print(f"[INFO] label source (fixed): ch0 ← {paths[0]}")
     return X
 
 def parse_csv_auto(args) -> torch.Tensor:

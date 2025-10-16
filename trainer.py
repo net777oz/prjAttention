@@ -56,6 +56,14 @@ def train_all_epochs(
     if task == "classify" and pos_weight_mode == "global" and (global_pos_weight is not None) and (bce_loss_fn is not None):
         bce_loss_fn.pos_weight = torch.tensor([float(global_pos_weight)], dtype=torch.float32, device=dev)
 
+    # [FIX] 공통: 모델 출력/라벨에서 ch0만 선택하여 1D(or 2D->1D) 강제
+    def _select_label_ch_first(logits: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if logits.dim() == 2:
+            logits = logits[:, 0]  # 첫 CSV (= ch 0)
+        if y.dim() == 2:
+            y = y[:, 0]
+        return logits, y
+
     # Live 패널 초기 렌더
     live = None
     if USE_RICH:
@@ -100,7 +108,6 @@ def train_all_epochs(
             )
             live.update(panel)
         else:
-            # 포맷 안정성(손실 NaN일 때도 깨지지 않도록)
             lc = float(loss_cur) if (loss_cur is not None and np.isfinite(loss_cur)) else float("nan")
             la = float(loss_avg) if (loss_avg is not None and np.isfinite(loss_avg)) else float("nan")
             print(
@@ -125,18 +132,28 @@ def train_all_epochs(
                 opt.zero_grad(set_to_none=True)
 
                 if amp_enabled:
-                    # 디바이스 자동 인식(cuda/mps/cpu). 혼합정밀은 cuda/mps에서만 켬.
                     amp_on = (dev.type in ("cuda", "mps"))
                     with torch_amp.autocast(device_type=dev.type, enabled=amp_on):
                         logits, _ = model(xb)
+
                         if task == "regress":
-                            loss = F.mse_loss(logits, yb)
+                            # [FIX] 회귀도 ch0만 타깃으로 일관 처리
+                            logits_sel, yb_sel = _select_label_ch_first(logits, yb)
+                            # 회귀 타깃은 연속값이므로 차원 가드는 동일하게 유지
+                            loss = F.mse_loss(logits_sel, yb_sel)
+
                         else:
+                            # [FIX] 분류: 손실/가중치 계산 전에 ch0만 선택
+                            logits_sel, yb_sel = _select_label_ch_first(logits, yb)
+                            if bce_loss_fn is None or softf1 is None:
+                                raise RuntimeError("Classification losses not initialized")
+
                             if pos_weight_mode == "batch":
-                                pw = compute_pos_weight_from_labels(yb)
+                                pw = compute_pos_weight_from_labels(yb_sel)
                                 bce_loss_fn.pos_weight = torch.tensor([pw], dtype=torch.float32, device=dev)
-                            bce = bce_loss_fn(logits, yb)  # type: ignore[arg-type]
-                            s1f = softf1(logits, yb)       # type: ignore[operator]
+
+                            bce = bce_loss_fn(logits_sel, yb_sel)  # type: ignore[arg-type]
+                            s1f = softf1(logits_sel, yb_sel)       # type: ignore[operator]
                             loss = alpha * bce + (1 - alpha) * s1f
 
                     if not torch.isfinite(loss):
@@ -150,14 +167,24 @@ def train_all_epochs(
 
                 else:
                     logits, _ = model(xb)
+
                     if task == "regress":
-                        loss = F.mse_loss(logits, yb)
+                        # [FIX] 회귀도 ch0만
+                        logits_sel, yb_sel = _select_label_ch_first(logits, yb)
+                        loss = F.mse_loss(logits_sel, yb_sel)
+
                     else:
+                        # [FIX] 분류도 ch0만
+                        logits_sel, yb_sel = _select_label_ch_first(logits, yb)
+                        if bce_loss_fn is None or softf1 is None:
+                            raise RuntimeError("Classification losses not initialized")
+
                         if pos_weight_mode == "batch":
-                            pw = compute_pos_weight_from_labels(yb)
+                            pw = compute_pos_weight_from_labels(yb_sel)
                             bce_loss_fn.pos_weight = torch.tensor([pw], dtype=torch.float32, device=dev)
-                        bce = bce_loss_fn(logits, yb)      # type: ignore[arg-type]
-                        s1f = softf1(logits, yb)           # type: ignore[operator]
+
+                        bce = bce_loss_fn(logits_sel, yb_sel)      # type: ignore[arg-type]
+                        s1f = softf1(logits_sel, yb_sel)           # type: ignore[operator]
                         loss = alpha * bce + (1 - alpha) * s1f
 
                     if not torch.isfinite(loss):
