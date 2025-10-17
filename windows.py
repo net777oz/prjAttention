@@ -3,16 +3,17 @@
 ╔════════════════════════════════════════════════════════════════════════════╗
 ║ FILE: windows.py                                                          ║
 ╠───────────────────────────────────────────────────────────────────────────╣
-║ PURPOSE  롤링 윈도우(Xw,Yw,groups,W) 생성                                 ║
+║ PURPOSE  롤링 윈도우(Xw, Yw, groups, W) 생성                               ║
 ╠───────────────────────────────────────────────────────────────────────────╣
 ║ PUBLIC INTERFACE                                                          ║
 ║   build_windows_dataset(X:[N,C,T], L:int, label_offset:int=1, step:int=1) ║
 ║     -> (Xw:[N*W,C,L], Yw:[N*W], groups:[N*W], W:int)                      ║
 ╠───────────────────────────────────────────────────────────────────────────╣
-║ NOTES                                                                      ║
-║  • 기본값은 Δ=+1 (윈도우 바로 다음 시점 라벨) → 기존 코드와 동작 동일         ║
-║  • Δ를 바꾸고 싶으면 label_offset=0(동시시점) 등으로 호출 가능                ║
-║  • 모든 소스는 동일한 T를 가진다고 가정하며, 라벨은 항상 ch0(main) 기준       ║
+║ NOTES                                                                     ║
+║  • 기본 Δ=+1 → 윈도우 끝(t = s+L-1)의 다음 시점(t+Δ)을 라벨로 사용            ║
+║  • Δ 변경은 label_offset으로 설정(예: 동시시점 라벨이면 Δ=0)                 ║
+║  • 모든 row가 동일한 T를 가진다고 가정, 라벨은 항상 ch0 기준                ║
+║  • 경계(T = L + Δ)에서도 W=1이 되도록 오프바이원(+1) 처리 완료               ║
 ╚════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -23,83 +24,89 @@ import torch
 def build_windows_dataset(
     X: torch.Tensor,
     L: int,
-    label_offset: int = 1,   # Δ=+1 (기본: 기존 코드와 동일)
-    step: int = 1,           # 슬라이딩 간격
+    label_offset: int = 1,   # Δ (기본: 다음 시점)
+    step: int = 1,           # 윈도우 시작 간격
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """
-    X: [N, C, T]
-      - C: 채널/CSV 수 (라벨은 항상 ch0에서 생성)
-    반환:
-      Xw:     [N*W, C, L]     입력 윈도우
-      Yw:     [N*W]           라벨(1D, ch0 기준)
-      groups: [N*W]           원본 row 인덱스
-      W:      int             윈도우 개수 (T - (L + Δ))
+    입력:
+      X: [N, C, T]  (torch.Tensor)
+         - C: 채널 수 (라벨은 ch0에서 생성)
+      L: 윈도우 길이 (context_len)
+      label_offset(Δ): 윈도우 끝에서 Δ 스텝 뒤 시점을 라벨로 사용 (기본 1)
+      step: 시작 인덱스 간격 (기본 1)
 
-    동작 개요:
-      • 각 row에 대해 시작 s = 0..W-1
-      • 입력: X[:, :, s : s+L]
-      • 라벨: X[:, 0,  s+L+Δ-1+1] == X[:, 0, s+L+Δ] (end-exclusive 관점)
-             → 구현은 벡터 슬라이스로 X[:, 0:1, L+Δ : L+Δ+W]
+    반환:
+      Xw:     [N*W, C, L]
+      Yw:     [N*W]           (float/long은 후단에서 변환)
+      groups: [N*W]           (row grouping id)
+      W:      int             윈도우 개수
+
+    정의:
+      - 윈도우 i의 시작 s_i = i * step
+      - 윈도우 범위: [s_i, s_i + L - 1]
+      - 라벨 인덱스: t_i = s_i + (L - 1) + Δ
+      - 유효 조건: t_i < T
+        → s_i ≤ T - (L + Δ)  → 최대 시작 s_max = T - (L + Δ)
+        → W = floor(s_max/step) + 1  (s_max ≥ 0일 때), 그렇지 않으면 W ≤ 0
     """
-    # 기본 형태 체크
+    # 기본 체크
     if X.dim() != 3:
         raise ValueError(f"X must be [N,C,T], got {tuple(X.shape)}")
+    if step < 1:
+        raise ValueError(f"step must be >= 1, got {step}")
+    if L < 1:
+        raise ValueError(f"L must be >= 1, got {L}")
+    if label_offset < 0:
+        raise ValueError(f"label_offset(Δ) must be >= 0, got {label_offset}")
+
     N, C, T = X.shape
 
-    if label_offset < 0 or label_offset >= T:
-        raise ValueError(f"label_offset({label_offset}) out of range for T={T}")
+    # L이 너무 크면(T-Δ보다 크면) 줄여서라도 동작하게 보정
+    if L > T - label_offset:
+        L = max(1, T - label_offset)
 
-    # Δ를 반영한 L 보정: L ∈ [1, T-Δ]
-    L = max(1, min(L, T - label_offset))
+    # 시작 인덱스의 최대값 s_max = T - (L + Δ)
+    s_max = T - (L + label_offset)
+    # W 계산(경계 T = L + Δ일 때 W = 1)
+    W = (s_max // step) + 1 if s_max >= 0 else 0
 
-    # 윈도우 개수: s+L+Δ-1 < T  ⇔  s ≤ T-(L+Δ)-1  ⇔  W = T - (L+Δ)
-    W = T - (L + label_offset)
     if W <= 0:
         raise ValueError(
             f"Invalid window count W={W}. Need T ≥ L + Δ. "
             f"(T={T}, L={L}, Δ={label_offset})"
         )
 
-    # 입력 윈도우 전개: [N, C, (T-L+1), L]
-    Xw_full = X.unfold(dimension=2, size=L, step=step)
-    # 안전장치: unfold로 나온 총 윈도우 수가 기대 이상인지 확인
-    # (step>1에서도 동작하도록 Xw_full.size(2) >= W 보장만 체크)
-    if Xw_full.size(2) < W:
-        # step>1인 경우 마지막 일부 윈도우가 잘릴 수 있으므로 W를 재산정
-        W = Xw_full.size(2)
-    # Δ를 고려해 뒤쪽 윈도우를 잘라 Δ만큼의 레이블 여유를 확보
-    Xw = Xw_full[:, :, :W, :]                         # [N, C, W, L]
+    # 입력 윈도우 전개: unfold로 모든 시작점 전개 후, Δ 고려하여 앞 W개만 사용
+    # unfold 결과 W_all = 1 + floor((T - L) / step)
+    Xw_all = X.unfold(dimension=2, size=L, step=step)  # [N, C, W_all, L]
+    W_all = Xw_all.size(2)
+    if W > W_all:
+        # 이론상 W ≤ W_all이어야 하나, 수치 엣지 대비 방어
+        W = W_all
+    Xw = Xw_all[:, :, :W, :]  # Δ로 인해 뒤쪽 일부를 버림
 
-    # 라벨 슬라이스: ch0에서 L+Δ ~ L+Δ+W-1
-    start_label = L + label_offset
-    end_label = start_label + W
-    if end_label > T:
-        # 이 경우도 실질적으로 W를 줄여 정합을 맞춤
-        W = T - start_label
-        if W <= 0:
+    # 라벨 인덱스: t_i = s_i + (L - 1) + Δ, where s_i = i*step, i=0..W-1
+    base = (L - 1) + label_offset
+    starts = torch.arange(W, device=X.device) * step            # [W]
+    label_idx = base + starts                                   # [W]
+    if label_idx[-1].item() >= T:
+        # 아주 드문 수치 엣지: label_idx가 T-1을 넘어가면 W를 조정
+        valid = (label_idx < T)
+        valid_count = int(valid.sum().item())
+        if valid_count <= 0:
             raise ValueError(
-                f"No room for labels: start_label={start_label}, T={T}"
+                f"No room for labels with L={L}, Δ={label_offset}, T={T}, step={step}"
             )
+        W = valid_count
         Xw = Xw[:, :, :W, :]
-        end_label = start_label + W
+        label_idx = label_idx[:W]
 
-    Yw_full = X[:, 0:1, start_label:end_label]        # [N, 1, W]
+    # ch0에서 라벨 뽑기 → [N, W]
+    Yw_mat = X[:, 0, label_idx]  # [N, W]
 
-    # 추가 안전장치
-    if Xw.shape[2] != Yw_full.shape[2]:
-        raise RuntimeError(
-            f"window/label count mismatch: Xw.W={Xw.shape[2]} vs Yw.W={Yw_full.shape[2]}"
-        )
-    if Xw.shape[-1] != L:
-        raise RuntimeError(
-            f"window length mismatch: got {Xw.shape[-1]} vs L={L}"
-        )
-
-    # 배치 평탄화
-    Xw = Xw.permute(0, 2, 1, 3).contiguous().view(N * W, C, L)   # [N*W, C, L]
-    Yw = Yw_full.permute(0, 2, 1).contiguous().view(N * W)       # [N*W]
-
-    # 그룹 인덱스
+    # 평탄화
+    Xw = Xw.permute(0, 2, 1, 3).contiguous().view(N * W, C, L)  # [N*W, C, L]
+    Yw = Yw_mat.contiguous().view(N * W)                        # [N*W]
     groups = torch.arange(N, device=X.device).repeat_interleave(W)  # [N*W]
 
     return Xw, Yw, groups, W
