@@ -1,0 +1,22 @@
+{
+  "generated_at": "2025-10-18 01:04:52",
+  "backbone": "llm_ts",
+  "task": "regress",
+  "context_len": 8,
+  "in_channels": 1,
+  "split_mode": "group",
+  "seed": 777,
+  "device": "cuda",
+  "amp": true,
+  "compile": "reduce-overhead",
+  "model_size": {
+    "params": 4739841
+  },
+  "data": {
+    "N": 99,
+    "C": 1,
+    "T": 364,
+    "train_windows": 28124,
+    "val_windows": 7120
+  }
+}
