@@ -8,8 +8,9 @@ pipeline.py — Train / Finetune / Infer 오케스트레이션 (다변량 입력
   • (중요) 평가/플롯은 검증 행(row)만 사용하도록 고정
   • (신규) out_dir 확정 직후 AP_OUT_DIR를 내부적으로 고정 → viz/evaler가 동일 런 폴더만 사용
   • (신규) plot_samples 호출을 viz.py 현재 시그니처로 교체
+  • (신규) 리포트용 산출물 저장: manifest.json / (classify) metrics.json+preds.csv / (regress) summary.json
 """
-import os, time
+import os, time, json, csv
 import torch
 import numpy as np
 from typing import Optional, List, Tuple
@@ -133,6 +134,54 @@ def _rows_from_indices(groups: torch.Tensor, idx_list: List[int]) -> List[int]:
     rows = torch.unique(sel).cpu().tolist()
     return sorted(int(r) for r in rows)
 
+# ──────────────────────── report helpers ─────────────────────────
+
+def _write_json(path, obj):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[WARN] write json failed {path}: {e}", flush=True)
+
+def _write_preds_csv(path, y_true_np, y_score_np, tau):
+    try:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["y_true", "y_score", f"y_pred@tau={tau:.3f}"])
+            yp = (y_score_np >= float(tau)).astype(int)
+            for yt, ys, yp1 in zip(y_true_np, y_score_np, yp):
+                w.writerow([int(yt), float(ys), int(yp1)])
+    except Exception as e:
+        print(f"[WARN] write preds.csv failed: {e}", flush=True)
+
+def _try_auroc_auprc(y_true_t, y_prob_t):
+    """metrics.roc_auc_pr_auc()이 있으면 사용, 없으면 (None, None)"""
+    try:
+        from metrics import roc_auc_pr_auc  # optional
+        auroc, auprc = roc_auc_pr_auc(y_true_t, y_prob_t)
+        return float(auroc), float(auprc)
+    except Exception:
+        return None, None
+
+def _save_manifest(out_dir, args, N, C, T, train_w, val_w, device, amp_available, compiled_mode, model):
+    base = _get_base_module(model)
+    n_params = sum(p.numel() for p in base.parameters())
+    man = {
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "backbone": args.backbone,
+        "task": args.task,
+        "context_len": int(args.context_len),
+        "in_channels": int(getattr(args, "_in_channels", C)),
+        "split_mode": args.split_mode,
+        "seed": int(args.seed),
+        "device": str(args.device),
+        "amp": bool(amp_available),
+        "compile": compiled_mode if compiled_mode else "OFF",
+        "model_size": {"params": int(n_params)},
+        "data": {"N": int(N), "C": int(C), "T": int(T), "train_windows": int(train_w), "val_windows": int(val_w)},
+    }
+    _write_json(os.path.join(out_dir, "manifest.json"), man)
+
 # ===== 메인 =====
 def main_run(args):
     set_seed(args.seed)
@@ -207,11 +256,17 @@ def main_run(args):
         if args.task == "regress":
             bmse, bmae, _, _ = eval_model(model, X, args.context_len, desc="infer", task="regress")
             print(f"[INFER] MSE={bmse:.6f} MAE={bmae:.6f}", flush=True)
-            # viz.plot_samples (신규 시그니처)
             try:
                 plot_samples(X, split="infer", max_samples=args.plot_samples, ch=0, title="Infer Samples")
             except Exception as e:
                 print(f"[WARN] plot_samples failed: {e}", flush=True)
+            # 회귀 요약 저장 (전체 데이터 기준)
+            summ = {
+                "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "avg_mse": float(bmse), "avg_mae": float(bmae),
+                "n_windows": int(W)
+            }
+            _write_json(os.path.join(out_dir, "summary.json"), summ)
         else:
             _, _, ytrue, yprob = eval_model(
                 model, X, args.context_len, desc="infer",
@@ -227,8 +282,25 @@ def main_run(args):
                     f"(MSE={rep['MSE']:.6f}, MAE={rep['MAE']:.6f})",
                     flush=True,
                 )
-                # 레거시 호환 시그니처도 지원되지만, 신규 방식으로 호출
                 plot_cls_curves(ytrue, yprob, split="infer", tau=args.thresh_default)
+                # 분류 요약 저장 (전체 데이터 기준)
+                auroc, auprc = _try_auroc_auprc(ytrue, yprob)
+                metrics_json = {
+                    "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "counts": {"n": int(ytrue.numel()), "pos": int((ytrue==1).sum().item()), "neg": int((ytrue==0).sum().item())},
+                    "prevalence": float((ytrue==1).float().mean().item()) if ytrue.numel() else None,
+                    "threshold_default": float(args.thresh_default),
+                    "metrics_at_default": {
+                        "threshold": float(rep["threshold"]),
+                        "precision": float(rep["Precision"]), "recall": float(rep["Recall"]),
+                        "f1": float(rep["F1"]), "accuracy": float(rep["Accuracy"]),
+                        "tp": int(rep["TP"]), "tn": int(rep["TN"]), "fp": int(rep["FP"]), "fn": int(rep["FN"]),
+                    },
+                    "threshold_best": None, "metrics_at_best": {},
+                    "roc_auc": auroc, "pr_auc": auprc
+                }
+                _write_json(os.path.join(out_dir, "metrics.json"), metrics_json)
+        _save_manifest(out_dir, args, N, C, T, len(trn_idx), len(val_idx), args.device, amp_available, compiled_mode, model)
         _save_ckpt(model, args, os.path.join(out_dir, "model.pt"))
         print(f"[DONE] infer saved to {out_dir}", flush=True)
         return
@@ -255,7 +327,6 @@ def main_run(args):
                 f"(MSE={rep_b['MSE']:.6f}, MAE={rep_b['MAE']:.6f})",
                 flush=True,
             )
-            # 레거시 인자(prefix/out_dir) 안 쓰고 신규 호출
             plot_cls_curves(ytrue_b, yprob_b, split="val", tau=args.thresh_default)
 
     # DataLoader
@@ -295,7 +366,6 @@ def main_run(args):
         task=args.task, alpha=args.alpha,
         pos_weight_mode=args.pos_weight, global_pos_weight=global_pw
     )
-    # 레거시 호출과 호환되지만, 신규 방식 사용
     plot_training_curve(loss_hist, split="val", title="Training Loss")
 
     # AFTER eval + (분류) τ 선택  — ★ 전부 '검증 행' 기준
@@ -306,13 +376,19 @@ def main_run(args):
         with open(os.path.join(out_dir, "train_report.txt"), "w", encoding="utf-8") as f:
             f.write(f"before(val) MSE {bmse:.6f} MAE {bmae:.6f}\n")
             f.write(f"after (val) MSE {amse:.6f} MAE {amae:.6f}\n")
-        # viz.plot_samples (신규 시그니처)
         try:
             plot_samples(X_val_rows, split="val", max_samples=args.plot_samples, ch=0, title="After (val) Samples")
         except Exception as e:
             print(f"[WARN] plot_samples failed: {e}", flush=True)
+        # 회귀 summary.json (VAL 기준)
+        summ = {
+            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "avg_mse": float(amse), "avg_mae": float(amae),
+            "n_windows": int(len(val_idx))
+        }
+        _write_json(os.path.join(out_dir, "summary.json"), summ)
     else:
-        # τ 선택은 'val windows(vl)'로 수행하되, 확률은 ch0만 사용
+        # τ 선택은 'val windows(vl)'로 수행
         probs_chunks, yv_chunks = [], []
         with torch.no_grad():
             for xb, yb in vl:
@@ -323,15 +399,11 @@ def main_run(args):
                         logits_b, _ = model(xb)
                 else:
                     logits_b, _ = model(xb)
-
-                # ---------------- [FIX] ch0 강제 + 1D 보장 ----------------
                 if logits_b.dim() == 2:
                     logits_b = logits_b[:, 0]          # [B]
                 probs_b = torch.sigmoid(logits_b)       # [B]
-                # ---------------------------------------------------------
-
                 probs_chunks.append(probs_b.detach().cpu())
-                yv_chunks.append(yb.detach().cpu())     # Yw_all은 이미 1D (windows.py 수정 반영)
+                yv_chunks.append(yb.detach().cpu())     # Yw_all은 1D
 
         if probs_chunks:
             probs_val = torch.cat(probs_chunks, dim=0).view(-1).float()
@@ -343,7 +415,7 @@ def main_run(args):
             tau, f1_at_tau = args.thresh_default, float("nan")
             print("[WARN] 검증 분할이 없어 τ 기본값을 사용합니다.", flush=True)
 
-        # AFTER 리포트/플롯도 '검증 행'만
+        # AFTER (VAL rows) 정식 평가
         _, _, ytrue_val, yprob_val = eval_model(
             model, X_val_rows, args.context_len, desc="after",
             task="classify", bin_rule=args.bin_rule, bin_thr=args.bin_thr,
@@ -362,8 +434,45 @@ def main_run(args):
             f.write(f"(val) F1 {rep['F1']:.6f} Acc {rep['Accuracy']:.6f} "
                     f"P {rep['Precision']:.6f} R {rep['Recall']:.6f}\n")
             f.write(f"(ref) MSE {rep['MSE']:.6f} MAE {rep['MAE']:.6f}\n")
-        # 레거시 인자(prefix/out_dir) 안 쓰고 신규 호출
         plot_cls_curves(ytrue_val, yprob_val, split="val", tau=rep["threshold"])
+
+        # 분류 metrics.json / preds.csv 저장 (VAL 기준)
+        auroc, auprc = _try_auroc_auprc(ytrue_val, yprob_val)
+        metrics_json = {
+            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "counts": {"n": int(ytrue_val.numel()), "pos": int((ytrue_val==1).sum().item()), "neg": int((ytrue_val==0).sum().item())},
+            "prevalence": float((ytrue_val==1).float().mean().item()) if ytrue_val.numel() else None,
+            "threshold_default": float(args.thresh_default),
+            "metrics_at_default": {
+                "threshold": float(args.thresh_default),
+                "precision": float(metrics_from_probs(ytrue_val, yprob_val, threshold=args.thresh_default)["Precision"]),
+                "recall": float(metrics_from_probs(ytrue_val, yprob_val, threshold=args.thresh_default)["Recall"]),
+                "f1": float(metrics_from_probs(ytrue_val, yprob_val, threshold=args.thresh_default)["F1"]),
+                "accuracy": float(metrics_from_probs(ytrue_val, yprob_val, threshold=args.thresh_default)["Accuracy"]),
+                "tp": int(metrics_from_probs(ytrue_val, yprob_val, threshold=args.thresh_default)["TP"]),
+                "tn": int(metrics_from_probs(ytrue_val, yprob_val, threshold=args.thresh_default)["TN"]),
+                "fp": int(metrics_from_probs(ytrue_val, yprob_val, threshold=args.thresh_default)["FP"]),
+                "fn": int(metrics_from_probs(ytrue_val, yprob_val, threshold=args.thresh_default)["FN"]),
+            },
+            "threshold_best": float(rep["threshold"]),
+            "metrics_at_best": {
+                "threshold": float(rep["threshold"]),
+                "precision": float(rep["Precision"]), "recall": float(rep["Recall"]),
+                "f1": float(rep["F1"]), "accuracy": float(rep["Accuracy"]),
+                "tp": int(rep["TP"]), "tn": int(rep["TN"]), "fp": int(rep["FP"]), "fn": int(rep["FN"]),
+            },
+            "roc_auc": auroc, "pr_auc": auprc
+        }
+        _write_json(os.path.join(out_dir, "metrics.json"), metrics_json)
+        _write_preds_csv(
+            os.path.join(out_dir, "preds.csv"),
+            y_true_np=ytrue_val.detach().cpu().numpy().astype(int),
+            y_score_np=yprob_val.detach().cpu().numpy().astype(float),
+            tau=float(rep["threshold"])
+        )
+
+    # 공통 manifest.json 저장 (러닝 메타)
+    _save_manifest(out_dir, args, N, C, T, len(trn_idx), len(val_idx), args.device, amp_available, compiled_mode, model)
 
     # 표준 저장 (메타에 in_channels 포함)
     _save_ckpt(model, args, os.path.join(out_dir, "model.pt"))

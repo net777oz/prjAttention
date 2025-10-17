@@ -6,6 +6,12 @@ evaler.py — 회귀/분류 공용 OOM-안전 평가 (이미지 비생성)
   * 회귀:  <run>/summary.json
 - 그림은 만들지 않음 (viz.py가 plots/after_<split>_*.png 한 군데만 생성)
 
+저장 시점 정책:
+  * 기본: AFTER / INFER 일 때만 저장 (BEFORE 등에서는 저장 안 함)
+  * 환경변수 AP_EVAL_SAVE_SCOPE:
+      - "auto" 또는 "after_only" → 위와 동일(기본)
+      - "never" → 어떤 단계에서도 파일 저장 안 함
+
 반환:
   회귀: (avg_mse, avg_mae, None, None)
   분류: (None, None, y_true_all, y_prob_all)
@@ -17,21 +23,23 @@ from pathlib import Path
 from windows import build_windows_dataset
 from utils import USE_RICH, console, build_eval_table
 
-# ─────────────────────────── 경로 유틸 ───────────────────────────
+# ─────────────────────────── 경로/정책 유틸 ───────────────────────────
 
 def _run_root() -> Path:
-    """
-    런 폴더 루트 결정.
-    - pipeline.py에서 out_dir 확정 직후 os.environ.setdefault("AP_OUT_DIR", str(out_dir))를 호출해야 함.
-    - 혹시라도 그 호출이 누락되면, 마지막 폴백으로 artifacts/default_run 사용(되도록이면 안 타게).
-    """
     base = os.environ.get("AP_OUT_DIR")
-    if base:
-        root = Path(base).expanduser().resolve()
-    else:
-        root = Path("./artifacts").resolve() / "default_run"
+    root = Path(base).expanduser().resolve() if base else Path("./artifacts").resolve() / "default_run"
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+def _should_save(desc: str, split_name: Optional[str]) -> bool:
+    """AFTER/INFER에서만 저장. AP_EVAL_SAVE_SCOPE로 오버라이드 가능."""
+    scope = (os.environ.get("AP_EVAL_SAVE_SCOPE") or "auto").lower()
+    if scope == "never":
+        return False
+    # auto / after_only
+    tag = (split_name or desc or "").lower()
+    # "after", "infer"가 들어가면 저장
+    return ("after" in tag) or ("infer" in tag)
 
 def _as_numpy(x: torch.Tensor) -> np.ndarray:
     return x.detach().float().cpu().numpy()
@@ -193,25 +201,30 @@ def eval_model(model,
 
     # ───────────────── 저장 & 리턴 ─────────────────
     run_root = _run_root()
+    save_allowed = _should_save(desc=str(desc), split_name=split_name)
 
     if task=="regress":
         avg_mse=float(np.mean(mse_list)) if mse_list else float("nan")
         avg_mae=float(np.mean(mae_list)) if mae_list else float("nan")
-        try:
-            _write_summary_json_reg(run_root, mse_list, mae_list)
-        except Exception as e:
-            print(f"[WARN] 회귀 요약 저장 실패: {e}")
+        if save_allowed:
+            try: _write_summary_json_reg(run_root, mse_list, mae_list)
+            except Exception as e: print(f"[WARN] 회귀 요약 저장 실패: {e}")
+        else:
+            print("[INFO] (evaler) SAVE SKIPPED (regress) — BEFORE/검증 중간단계이거나 정책상 저장 안 함")
         return (avg_mse, avg_mae, None, None)
     else:
         yprob=torch.cat(prob_buf,0) if prob_buf else torch.empty(0)
         ytrue=torch.cat(true_buf,0) if true_buf else torch.empty(0)
         if ytrue.numel()>0 and yprob.numel()>0:
-            try:
-                y_true_np=_as_numpy(ytrue).astype(int); y_score_np=_as_numpy(yprob).astype(float)
-                _save_preds_csv(run_root, y_true_np, y_score_np, tau_default=tau_for_cls)
-                _write_metrics_json_cls(run_root, y_true_np, y_score_np, tau_default=tau_for_cls)
-            except Exception as e:
-                print(f"[WARN] 분류 메트릭 저장 실패: {e}")
+            if save_allowed:
+                try:
+                    y_true_np=_as_numpy(ytrue).astype(int); y_score_np=_as_numpy(yprob).astype(float)
+                    _save_preds_csv(run_root, y_true_np, y_score_np, tau_default=tau_for_cls)
+                    _write_metrics_json_cls(run_root, y_true_np, y_score_np, tau_default=tau_for_cls)
+                except Exception as e:
+                    print(f"[WARN] 분류 메트릭 저장 실패: {e}")
+            else:
+                print("[INFO] (evaler) SAVE SKIPPED (classify) — BEFORE/검증 중간단계이거나 정책상 저장 안 함")
         else:
-            print("[WARN] 라벨 없음 → 순수 추론: 지표/CSV 저장 생략")
+            print("[WARN] 라벨/확률 비어 있음 → 지표/CSV 저장 생략")
         return None, None, ytrue, yprob

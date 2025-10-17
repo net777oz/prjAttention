@@ -2,9 +2,11 @@
 """
 report_artifacts.py — Static HTML Report (images embedded via base64 data URIs)
 + Hover Zoom Lens (cursor-centered magnifier, no external deps)
++ Leaderboard (static) + Manifest/Perf summaries (optional if files exist)
+
 - artifacts/**/ 에서 model.pt 들어있는 폴더만 런으로 간주
 - 각 런의 핵심 지표를 카드 내 표로 바로 표시 (링크 없음)
-- 각 런의 plots/after_*.png 이미지를 data URI로 HTML에 직접 포함 (외부 경로/링크 없음)
+- plots/after_*.png 이미지를 data URI로 HTML에 직접 포함 (외부 경로/링크 없음)
 
 Usage:
   python tools/report_artifacts.py \
@@ -53,7 +55,6 @@ def try_parse_metrics_from_preds(preds_csv: Path):
     if not preds_csv.exists():
         return None
     tp=tn=fp=fn=0
-    has_score = False
     n=0; pos=0; neg=0
     try:
         with preds_csv.open("r", encoding="utf-8") as f:
@@ -61,7 +62,6 @@ def try_parse_metrics_from_preds(preds_csv: Path):
             header = next(r, None)
             if not header: return None
             yi = header.index("y_true") if "y_true" in header else None
-            si = header.index("y_score") if "y_score" in header else None
             pi = None
             for j, h in enumerate(header):
                 if h.startswith("y_pred@tau="):
@@ -71,8 +71,6 @@ def try_parse_metrics_from_preds(preds_csv: Path):
             for row in r:
                 y = int(float(row[yi]))
                 p = int(float(row[pi]))
-                if si is not None:
-                    has_score = True
                 if y == 1:
                     pos += 1
                     if p == 1: tp += 1
@@ -99,7 +97,7 @@ def try_parse_metrics_from_preds(preds_csv: Path):
         return None
 
 def collect_run(run_dir: Path, max_images: int):
-    """Collect metrics & after_* images (list of Paths)."""
+    """Collect metrics & after_* images (list of Paths). Also manifest/perf if present."""
     plots = sorted((run_dir / "plots").glob("after_*.png"))
     if max_images > 0:
         plots = plots[:max_images]
@@ -107,6 +105,8 @@ def collect_run(run_dir: Path, max_images: int):
     metrics_json = run_dir / "metrics.json"
     summary_json = run_dir / "summary.json"
     preds_csv    = run_dir / "preds.csv"
+    manifest_json = run_dir / "manifest.json"
+    perf_json     = run_dir / "perf.json"
 
     kind = "unknown"
     metrics = None
@@ -122,9 +122,9 @@ def collect_run(run_dir: Path, max_images: int):
                 "prev": raw.get("prevalence"),
                 "auroc": raw.get("roc_auc"),
                 "auprc": raw.get("pr_auc"),
-                "tau_def": raw.get("threshold_default"),
+                "tau_def": (raw.get("metrics_at_default") or {}).get("threshold", raw.get("threshold_default")),
                 "m_def": raw.get("metrics_at_default") or {},
-                "tau_best": raw.get("threshold_best"),
+                "tau_best": (raw.get("metrics_at_best") or {}).get("threshold", raw.get("threshold_best")),
                 "m_best": raw.get("metrics_at_best") or {},
                 "generated_at": raw.get("generated_at"),
             }
@@ -135,6 +135,11 @@ def collect_run(run_dir: Path, max_images: int):
             metrics = {
                 "mse": raw.get("avg_mse"),
                 "mae": raw.get("avg_mae"),
+                "rmse": raw.get("rmse"),
+                "r2": raw.get("r2"),
+                "mape": raw.get("mape"),
+                "smape": raw.get("smape"),
+                "mase": raw.get("mase"),
                 "nwin": raw.get("n_windows"),
                 "generated_at": raw.get("generated_at"),
             }
@@ -154,7 +159,10 @@ def collect_run(run_dir: Path, max_images: int):
                 "generated_at": None,
             }
 
-    return kind, metrics, plots
+    manifest = safe_read_json(manifest_json) if manifest_json.exists() else None
+    perf     = safe_read_json(perf_json) if perf_json.exists() else None
+
+    return kind, metrics, plots, manifest, perf
 
 def fmt(v, nd=4, na="-"):
     try:
@@ -171,17 +179,97 @@ def image_to_data_uri(path: Path) -> str:
     mime = mimetypes.guess_type(str(path))[0] or "image/png"
     return f"data:{mime};base64,{b64}"
 
+# --------------------------- Leaderboard build ---------------------------
+
+def build_leaderboard_rows(runs_info):
+    """
+    Build a static leaderboard rows list of dicts.
+    For classification: name, F1_best, F1_def, AUROC, AUPRC, N
+    For regression:     name, MAE, RMSE, R2, #Win
+    """
+    rows = []
+    for info in runs_info:
+        run = info["dir"].name
+        kind = info["kind"]
+        md = info["metrics"]
+        if kind == "classify" and isinstance(md, dict):
+            n = md.get("n")
+            f1_def = (md.get("m_def") or {}).get("f1")
+            f1_best = (md.get("m_best") or {}).get("f1")
+            rows.append({
+                "name": run, "type": "CLS",
+                "c1": fmt(f1_best, 4), "c2": fmt(f1_def, 4),
+                "c3": fmt(md.get("auroc"), 4), "c4": fmt(md.get("auprc"), 4),
+                "c5": str(int(n)) if isinstance(n, (int, float)) else "-"
+            })
+        elif kind == "regress" and isinstance(md, dict):
+            rows.append({
+                "name": run, "type": "REG",
+                "c1": fmt(md.get("mae"), 6), "c2": fmt(md.get("rmse"), 6),
+                "c3": fmt(md.get("r2"), 4),  "c4": fmt(md.get("smape"), 2),
+                "c5": str(int(md.get("nwin"))) if isinstance(md.get("nwin"), (int, float)) else "-"
+            })
+    return rows
+
+def render_leaderboard_html(rows):
+    if not rows:
+        return ""
+    # Determine header by detecting presence of CLS or REG
+    has_cls = any(r["type"] == "CLS" for r in rows)
+    has_reg = any(r["type"] == "REG" for r in rows)
+
+    head = []
+    if has_cls and not has_reg:
+        head = ["Run", "Type", "F1@best", "F1@def", "AUROC", "AUPRC", "N"]
+    elif has_reg and not has_cls:
+        head = ["Run", "Type", "MAE", "RMSE", "R²", "sMAPE", "#Win"]
+    else:
+        # mixed
+        head = ["Run", "Type", "Col1", "Col2", "Col3", "Col4", "Col5"]
+
+    th = "".join(f"<th>{html.escape(h)}</th>" for h in head)
+    trs = []
+    for r in rows:
+        tds = [
+            f"<td style='text-align:left'>{html.escape(r['name'])}</td>",
+            f"<td>{r['type']}</td>",
+            f"<td>{r['c1']}</td>",
+            f"<td>{r['c2']}</td>",
+            f"<td>{r['c3']}</td>",
+            f"<td>{r['c4']}</td>",
+            f"<td>{r['c5']}</td>",
+        ]
+        trs.append("<tr>" + "".join(tds) + "</tr>")
+    table = f"""
+    <section class="leader">
+      <h2>Leaderboard</h2>
+      <table class="leader-table">
+        <thead><tr>{th}</tr></thead>
+        <tbody>
+          {''.join(trs)}
+        </tbody>
+      </table>
+    </section>
+    """
+    return table
+
 # --------------------------- HTML build ---------------------------
 
-def build_html(runs: list[Path], title: str, max_images: int) -> str:
+def build_html(run_dirs: list, title: str, max_images: int) -> str:
     css = """
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,'Apple SD Gothic Neo','Noto Sans KR',sans-serif;background:#0b0d10;color:#e7ecf3;margin:0}
-    header{padding:20px 24px;border-bottom:1px solid #1d232f;background:#0f1116;position:sticky;top:0}
-    h1{font-size:20px;margin:0}
+    header.top{padding:20px 24px;border-bottom:1px solid #1d232f;background:#0f1116;position:sticky;top:0;z-index:2}
+    header.top h1{font-size:20px;margin:0}
     main{padding:18px}
+    .leader{margin:0 0 16px 0}
+    .leader h2{font-size:16px;margin:0 0 8px 0}
+    .leader-table{width:100%;border-collapse:collapse;background:#121621;border:1px solid #1e293b;border-radius:14px;overflow:hidden}
+    .leader-table th,.leader-table td{border-bottom:1px solid #233044;padding:8px 6px;font-size:13px;text-align:right}
+    .leader-table th:first-child,.leader-table td:first-child{text-align:left;color:#b6c6d8}
     .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:16px}
     .card{background:#121621;border:1px solid #1e293b;border-radius:14px;padding:14px}
-    .card h2{font-size:16px;margin:0 0 8px 0;word-break:break-all}
+    .card h2{font-size:16px;margin:0 0 8px 0;word-break:break-all;display:flex;align-items:center;gap:8px}
+    .badge{display:inline-block;background:#1e293b;border:1px solid #2a3a52;border-radius:10px;padding:2px 8px;font-size:11px;color:#dbe7f3}
     .meta{font-size:12px;color:#9fb1c5;margin-bottom:8px}
     table{width:100%;border-collapse:collapse;margin:8px 0}
     th,td{border-bottom:1px solid #233044;padding:6px 4px;font-size:13px;text-align:right}
@@ -197,7 +285,7 @@ def build_html(runs: list[Path], title: str, max_images: int) -> str:
       display:none; z-index:9999}
     """
 
-    # 간단한 마우스 루페 JS (cursor-centered zoom, wheel로 배율 조절)
+    # 루페 JS
     js = """
     <script>
     (function(){
@@ -206,8 +294,8 @@ def build_html(runs: list[Path], title: str, max_images: int) -> str:
       document.body.appendChild(lens);
 
       let active = null;
-      let zoom = 2.5;               // 기본 배율
-      const Z_MIN = 1.5, Z_MAX = 6; // 배율 범위
+      let zoom = 2.5;
+      const Z_MIN = 1.5, Z_MAX = 6;
 
       function onEnter(e){
         const img = e.currentTarget;
@@ -215,69 +303,136 @@ def build_html(runs: list[Path], title: str, max_images: int) -> str:
         lens.style.display = 'block';
         lens.style.backgroundImage = `url(${img.src})`;
       }
-
       function onLeave(){
         active = null;
         lens.style.display = 'none';
       }
-
       function onMove(e){
         if(!active) return;
         const rect = active.getBoundingClientRect();
         const cx = e.clientX - rect.left;
         const cy = e.clientY - rect.top;
-
-        // 원본 대비 배율
         const rx = active.naturalWidth / active.clientWidth;
         const ry = active.naturalHeight / active.clientHeight;
-
-        // 렌즈 위치 (커서 중심)
         const lw = lens.offsetWidth, lh = lens.offsetHeight;
         lens.style.left = (e.clientX - lw/2) + 'px';
         lens.style.top  = (e.clientY - lh/2) + 'px';
-
-        // 배경 이미지 스케일
         lens.style.backgroundSize = (active.naturalWidth*zoom)+'px ' + (active.naturalHeight*zoom)+'px';
-
-        // 배경 위치: 커서 지점이 렌즈 중앙에 오도록
         const bgX = -(cx*rx*zoom - lw/2);
         const bgY = -(cy*ry*zoom - lh/2);
         lens.style.backgroundPosition = bgX+'px '+bgY+'px';
       }
-
       function onWheel(e){
         if(!active) return;
         e.preventDefault();
         const delta = Math.sign(e.deltaY);
-        if (delta < 0) zoom *= 1.1;    // up → 확대
-        else zoom /= 1.1;              // down → 축소
+        zoom = delta < 0 ? zoom*1.1 : zoom/1.1;
         zoom = Math.max(Z_MIN, Math.min(Z_MAX, zoom));
         onMove(e);
       }
-
-      // 모든 이미지에 바인딩
       function bindZoom(img){
         img.addEventListener('mouseenter', onEnter);
         img.addEventListener('mouseleave', onLeave);
         img.addEventListener('mousemove', onMove);
         img.addEventListener('wheel', onWheel, {passive:false});
       }
-
       document.querySelectorAll('img.zoomable').forEach(bindZoom);
     })();
     </script>
     """
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cards = []
 
-    for run_dir in runs:
+    # 먼저 런 정보를 수집하여 리더보드 생성
+    runs_info = []
+    for run_dir in run_dirs:
+        run_name = run_dir.name
+        kind, md, imgs, manifest, perf = collect_run(run_dir, max_images)
+        runs_info.append({
+            "dir": run_dir,
+            "name": run_name,
+            "kind": kind,
+            "metrics": md or {},
+            "images": imgs,
+            "manifest": manifest,
+            "perf": perf
+        })
+
+    # Leaderboard 섹션
+    lb_rows = build_leaderboard_rows(runs_info)
+    leader_html = render_leaderboard_html(lb_rows)
+
+    # 카드들 생성
+    cards = []
+    for info in runs_info:
+        run_dir = info["dir"]
         run_name = run_dir.name
         when = datetime.fromtimestamp(run_dir.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-        kind, md, imgs = collect_run(run_dir, max_images)
+        kind = info["kind"]; md = info["metrics"]; imgs = info["images"]
+        manifest = info["manifest"]; perf = info["perf"]
+
+        # 제목 배지
+        badge = ""
+        if kind == "classify":
+            f1_best = (md.get("m_best") or {}).get("f1")
+            if f1_best is None:
+                f1_best = (md.get("m_def") or {}).get("f1")
+            if f1_best is not None:
+                badge = f"<span class='badge'>F1 {fmt(f1_best,4)}</span>"
+        elif kind == "regress":
+            if md.get("mae") is not None:
+                badge = f"<span class='badge'>MAE {fmt(md.get('mae'),6)}</span>"
 
         # Header
-        card = [f'<div class="card">', f"<h2>{html.escape(run_name)}</h2>", f'<div class="meta">{html.escape(when)}</div>']
+        card = [f'<div class="card">', f"<h2>{html.escape(run_name)} {badge}</h2>", f'<div class="meta">{html.escape(when)}</div>']
+
+        # Manifest/Perf 요약 (있을 때만)
+        if isinstance(manifest, dict):
+            mdev = manifest.get("device")
+            amp = manifest.get("amp")
+            comp = manifest.get("compile")
+            back = manifest.get("backbone")
+            ctx = manifest.get("context_len")
+            ch = manifest.get("in_channels")
+            params = (manifest.get("model_size") or {}).get("params")
+            ds = manifest.get("data") or {}
+            n = ds.get("N"); c = ds.get("C"); t = ds.get("T")
+            trw = ds.get("train_windows"); vaw = ds.get("val_windows")
+            card.append("<table>")
+            card.append("<tr><th>Run meta</th><td></td></tr>")
+            if back is not None:
+                card.append(f"<tr><th>Backbone</th><td>{html.escape(str(back))}</td></tr>")
+            if params is not None:
+                card.append(f"<tr><th>Params</th><td>{int(params):,}</td></tr>")
+            if ctx is not None or ch is not None:
+                card.append(f"<tr><th>Input</th><td>C={html.escape(str(ch))} · L={html.escape(str(ctx))}</td></tr>")
+            if (n is not None) or (c is not None) or (t is not None):
+                card.append(f"<tr><th>Data (N,C,T)</th><td>{n}/{c}/{t}</td></tr>")
+            if (trw is not None) or (vaw is not None):
+                card.append(f"<tr><th>Windows</th><td>train {trw} · val {vaw}</td></tr>")
+            if mdev is not None or amp is not None or comp is not None:
+                card.append(f"<tr><th>Device</th><td>{html.escape(str(mdev))} · amp {amp} · compile {html.escape(str(comp))}</td></tr>")
+            card.append("</table>")
+
+        if isinstance(perf, dict):
+            thr = perf.get("throughput_sps")
+            lat = perf.get("latency_ms") or {}
+            p95 = (perf.get("latency") or {}).get("p95_ms")
+            maxmem = perf.get("max_mem_mb")
+            card.append("<table>")
+            card.append("<tr><th>Performance</th><td></td></tr>")
+            if thr is not None:
+                card.append(f"<tr><th>Throughput</th><td>{fmt(thr,2)} samples/s</td></tr>")
+            if lat:
+                # show few keys if present
+                keys = sorted(lat.keys())
+                show = ", ".join([f"{k}:{fmt(lat[k],2)}ms" for k in keys[:4]])
+                card.append(f"<tr><th>Latency</th><td>{show}</td></tr>")
+            if p95 is not None:
+                card.append(f"<tr><th>Latency p95</th><td>{fmt(p95,2)} ms</td></tr>")
+            if maxmem is not None:
+                card.append(f"<tr><th>Max Mem</th><td>{fmt(maxmem,0)} MB</td></tr>")
+            card.append("</table>")
 
         # Metrics table (embedded, no links)
         if kind == "classify" and isinstance(md, dict):
@@ -307,15 +462,23 @@ def build_html(runs: list[Path], title: str, max_images: int) -> str:
         elif kind == "regress" and isinstance(md, dict):
             card.append("<table>")
             card.append("<tr><th>Type</th><td>Regression</td></tr>")
-            card.append(f"<tr><th>avg MSE</th><td>{fmt(md.get('mse'),6)}</td></tr>")
-            card.append(f"<tr><th>avg MAE</th><td>{fmt(md.get('mae'),6)}</td></tr>")
+            if md.get("mse") is not None:
+                card.append(f"<tr><th>avg MSE</th><td>{fmt(md.get('mse'),6)}</td></tr>")
+            if md.get("mae") is not None:
+                card.append(f"<tr><th>avg MAE</th><td>{fmt(md.get('mae'),6)}</td></tr>")
+            if md.get("rmse") is not None or md.get("r2") is not None:
+                card.append(f"<tr><th>RMSE / R²</th><td>{fmt(md.get('rmse'),6)} / {fmt(md.get('r2'),4)}</td></tr>")
+            if md.get("mape") is not None or md.get("smape") is not None:
+                card.append(f"<tr><th>MAPE / sMAPE</th><td>{fmt(md.get('mape'),2)}% / {fmt(md.get('smape'),2)}%</td></tr>")
+            if md.get("mase") is not None:
+                card.append(f"<tr><th>MASE</th><td>{fmt(md.get('mase'),3)}</td></tr>")
             if md.get("nwin") is not None:
                 card.append(f"<tr><th>#Windows</th><td>{int(md.get('nwin'))}</td></tr>")
             card.append("</table>")
         else:
             card.append('<div class="meta empty">No metrics found (metrics.json/summary.json/preds.csv)</div>')
 
-        # Thumbnails (embedded data URIs) — zoomable 클래스를 부여
+        # Thumbnails (embedded data URIs) — zoomable
         if imgs:
             card.append('<div class="thumbs">')
             for im in imgs:
@@ -344,13 +507,14 @@ def build_html(runs: list[Path], title: str, max_images: int) -> str:
 <style>{css}</style>
 </head>
 <body>
-<header><h1>{html.escape(title)}</h1></header>
+<header class="top"><h1>{html.escape(title)}</h1></header>
 <main>
+  {leader_html}
   <div class="grid">
     {''.join(cards)}
   </div>
 </main>
-<footer>Generated at {html.escape(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))}</footer>
+<footer>Generated at {html.escape(now)}</footer>
 {js}
 </body>
 </html>
@@ -371,8 +535,8 @@ def main():
     out_html = Path(args.out).resolve()
     out_html.parent.mkdir(parents=True, exist_ok=True)
 
-    runs = find_runs(artifacts_dir)
-    html_text = build_html(runs, args.title, args.max_images)
+    run_dirs = find_runs(artifacts_dir)
+    html_text = build_html(run_dirs, args.title, args.max_images)
     out_html.write_text(html_text, encoding="utf-8")
     print(f"[OK] Wrote static (embedded) report: {out_html}")
 

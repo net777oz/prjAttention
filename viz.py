@@ -10,8 +10,15 @@ viz.py — 모든 플롯은 여기서만 생성 (중복 생성 없음, 레거시
   - plot_pr(y_true, y_score, split)
   - plot_score_hists(y_true, y_score, split)
   - plot_confusion(y_true_bin, y_pred_bin, split)
+  - plot_calibration(y_true, y_score, split, bins=15)
+  - plot_ks(y_true, y_score, split)
+  - plot_cost_curve(y_true, y_score, split, fp_cost=1.0, fn_cost=1.0, steps=200)
+  - plot_lift_gain(y_true, y_score, split, steps=20)
   - plot_residuals(y_true, y_pred, split)
+  - plot_residual_qq(y_true, y_pred, split)
+  - plot_residual_time(y_true, y_pred, split)
   - plot_pred_vs_true(y_true, y_pred, split)
+  - plot_latency_bar(latency_dict, split)
   - plot_samples(X, y_true=None, y_pred=None, split='val', max_samples=3, ch=0, title='Samples')
 """
 import os
@@ -24,7 +31,7 @@ def _run_root() -> Path:
     base = os.environ.get("AP_OUT_DIR")
     if base:
         return Path(base).expanduser().resolve()
-    return Path("./artifacts").resolve() / "default_run"  # 러너에서 AP_OUT_DIR 세팅 권장
+    return Path("./artifacts").resolve() / "default_run"
 
 def _plots_dir() -> Path:
     p = _run_root() / "plots"
@@ -51,27 +58,23 @@ def _looks_numeric_series(x):
         arr = _to_np(x)
         if arr is None: return False
         arr = np.asarray(arr)
-        if arr.dtype.kind in ("i", "u", "f"):  # int/uint/float
-            return True
-        # 문자열 배열일 수 있음
-        return False
+        return arr.dtype.kind in ("i", "u", "f")
     except Exception:
         return False
 
 def _compat_resolve_split_tau(args, kwargs, default_split="val", default_tau=0.5):
     """
     지원 패턴:
-      - (split='val', tau=0.5)  # 키워드
-      - ("val",)                # 첫 위치인자 = split
-      - (0.5, ...)              # 첫 위치인자 = tau (레거시)
-      - (tau, out_dir, prefix='before_val')  # 레거시: prefix에서 split 추출
+      - (split='val', tau=0.5)
+      - ("val",)
+      - (0.5, ...)
+      - (tau, out_dir, prefix='before_val')
     반환: (split, tau)
     """
     split = kwargs.pop("split", None)
     tau = kwargs.pop("tau", None)
-    prefix = kwargs.get("prefix")  # 그대로 두되 저장엔 사용 안 함
+    prefix = kwargs.get("prefix")  # 저장명엔 사용 안 함
 
-    # 위치 인자 해석
     if len(args) == 1:
         a0 = args[0]
         if isinstance(a0, str):
@@ -81,13 +84,12 @@ def _compat_resolve_split_tau(args, kwargs, default_split="val", default_tau=0.5
     elif len(args) >= 2:
         a0, a1 = args[0], args[1]
         if isinstance(a0, (int, float)):
-            tau = float(a0)        # (tau, out_dir, prefix=...)
+            tau = float(a0)
         elif isinstance(a0, str):
-            split = a0             # ("val", tau, ...)
+            split = a0
             if isinstance(a1, (int, float)):
                 tau = float(a1)
 
-    # prefix로부터 split 추출(예: "before_val" → "val")
     if (not split) and isinstance(prefix, str) and "_" in prefix:
         split = prefix.split("_")[-1]
 
@@ -101,26 +103,15 @@ def _compat_resolve_split_tau(args, kwargs, default_split="val", default_tau=0.5
 
 def plot_training_curve(train_losses, val_losses=None, *args, **kwargs):
     """
-    호환되는 호출 예:
-      - plot_training_curve(tr, va, split='val')
-      - plot_training_curve(tr, va, out_dir, prefix='before_val')
-      - plot_training_curve(tr, out_dir, title='Training Loss')  # 레거시: 두번째가 경로면 무시
     저장: plots/after_<split>_loss.png
     """
-    # 1) 두번째 위치 인자가 숫자 시퀀스가 아니면(경로/문자열) → val_losses=None로 간주
     if not _looks_numeric_series(val_losses):
-        # val_losses가 경로/문자열/None인 경우, 레거시 호출로 간주하고 무시
         val_losses = None
-        # args는 그대로 split/tau 해석용으로 넘김
-
-    # 2) args에 '숫자 시퀀스'가 첫 슬롯으로 온 경우(레거시: tr, va, out_dir, ...) → 그걸 val_losses로 해석
     args_list = list(args)
     if val_losses is None and len(args_list) > 0 and _looks_numeric_series(args_list[0]):
         val_losses = args_list[0]
-        args_list = args_list[1:]  # 나머지는 split/tau/out_dir/prefix 등
-
-    # 3) split/tau 해석 (out_dir는 무시, prefix에서 split 추출)
-    split, _ = _compat_resolve_split_tau(tuple(args_list), kwargs, default_split="val", default_tau=0.5)
+        args_list = args_list[1:]
+    split, _ = _compat_resolve_split_tau(tuple(args_list), kwargs)
 
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
     tr = _to_np(train_losses).astype(float).ravel() if train_losses is not None else None
@@ -131,7 +122,9 @@ def plot_training_curve(train_losses, val_losses=None, *args, **kwargs):
         plt.plot(np.arange(1, tr.size+1), tr, label="train")
     if va is not None and va.size > 0:
         plt.plot(np.arange(1, va.size+1), va, label="val")
-    plt.xlabel("epoch"); plt.ylabel("loss"); plt.title(kwargs.get("title", "Training Curve")); plt.grid(True, alpha=0.3)
+    plt.xlabel("epoch"); plt.ylabel("loss")
+    plt.title(kwargs.get("title", "Training Curve"))
+    plt.grid(True, alpha=0.3)
     if (tr is not None and tr.size>0) and (va is not None and va.size>0):
         plt.legend(loc="best")
     return _savefig(fig, split, "loss")
@@ -140,17 +133,13 @@ def plot_training_curve(train_losses, val_losses=None, *args, **kwargs):
 
 def plot_cls_curves(y_true, y_score, *args, **kwargs):
     """
-    분류 전용 종합 플로팅(레거시/신규 모두 지원):
-      - 신규: plot_cls_curves(y_true, y_score, split='val', tau=0.5)
-      - 레거시: plot_cls_curves(y_true, y_score, tau, out_dir, prefix='before_val')
     저장물:
-      plots/after_<split>_roc.png
-      plots/after_<split>_pr.png
-      plots/after_<split>_hist_all.png (+ _pos/_neg)
-      plots/after_<split>_confusion.png   (τ 기준)
-    반환: {"roc":Path, "pr":Path, "hist_all":Path, "confusion":Path, ...}
+      after_<split>_roc.png
+      after_<split>_pr.png
+      after_<split>_hist_all.png (+ _pos/_neg)
+      after_<split>_confusion.png   (τ 기준)
     """
-    split, tau = _compat_resolve_split_tau(args, kwargs, default_split="val", default_tau=0.5)
+    split, tau = _compat_resolve_split_tau(args, kwargs)
     yt = _to_np(y_true).astype(int).ravel()
     ys = _to_np(y_score).astype(float).ravel()
     out = {}
@@ -190,6 +179,7 @@ def plot_pr(y_true: np.ndarray, y_score: np.ndarray, split: str):
     tp = np.cumsum(yt==1); fp = np.cumsum(yt==0); fn = P - tp
     prec = np.divide(tp, tp+fp, out=np.zeros_like(tp, dtype=float), where=(tp+fp)>0)
     rec  = np.divide(tp, tp+fn, out=np.zeros_like(tp, dtype=float), where=(tp+fn)>0)
+    import matplotlib.pyplot as plt
     fig = plt.figure(); plt.plot(np.r_[0,rec], np.r_[1,prec])
     plt.xlabel("Recall"); plt.ylabel("Precision"); plt.title("PR"); plt.grid(True, alpha=0.3)
     return _savefig(fig, split, "pr")
@@ -225,6 +215,125 @@ def plot_confusion(y_true_bin: np.ndarray, y_pred_bin: np.ndarray, split: str):
     plt.title("Confusion"); plt.grid(False)
     return _savefig(fig, split, "confusion")
 
+# ───── 추가 분류 플롯: Calibration / KS / Cost Curve / Lift-Gain ─────
+
+def plot_calibration(y_true, y_score, split: str, bins: int = 15):
+    """
+    Reliability diagram + ECE/MCE 표시
+    """
+    import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+    yt = _to_np(y_true).astype(int).ravel()
+    ys = _to_np(y_score).astype(float).ravel()
+    ys = np.clip(ys, 1e-9, 1-1e-9)
+    bins = max(3, int(bins))
+    edges = np.linspace(0, 1, bins+1)
+    idx = np.digitize(ys, edges) - 1
+    accs, confs, counts = [], [], []
+    for b in range(bins):
+        m = (idx == b)
+        if m.sum() == 0:
+            accs.append(np.nan); confs.append((edges[b]+edges[b+1])/2); counts.append(0)
+        else:
+            accs.append( (yt[m]==1).mean() )
+            confs.append( ys[m].mean() )
+            counts.append( m.sum() )
+    accs = np.array(accs); confs = np.array(confs); counts = np.array(counts)
+    valid = counts > 0
+    ece = np.nansum( (counts[valid]/counts[valid].sum()) * np.abs(accs[valid]-confs[valid]) )
+    mce = np.nanmax( np.abs(accs[valid]-confs[valid]) ) if valid.any() else np.nan
+
+    fig = plt.figure()
+    plt.plot([0,1],[0,1],'--',alpha=0.6,label='Perfect')
+    plt.scatter(confs[valid], accs[valid], s=20, alpha=0.9, label='Bins')
+    plt.xlabel("Confidence"); plt.ylabel("Empirical accuracy")
+    plt.title(f"Calibration (ECE={ece:.3f}, MCE={mce:.3f})")
+    plt.grid(True, alpha=0.3); plt.legend(loc="best")
+    return _savefig(fig, split, "calibration")
+
+def plot_ks(y_true, y_score, split: str):
+    """
+    KS 곡선 및 KS 통계(최대 거리) 표시
+    """
+    import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+    yt = _to_np(y_true).astype(int).ravel()
+    ys = _to_np(y_score).astype(float).ravel()
+    order = np.argsort(ys)  # ascending
+    ys = ys[order]; yt = yt[order]
+    pos = (yt==1).sum(); neg = (yt==0).sum()
+    cum_pos = np.cumsum(yt==1)/max(1,pos)
+    cum_neg = np.cumsum(yt==0)/max(1,neg)
+    ks_vals = np.abs(cum_pos - cum_neg)
+    ks = float(np.max(ks_vals))
+    i = int(np.argmax(ks_vals))
+    thr = ys[i]
+
+    fig = plt.figure()
+    x = np.linspace(0,1,len(ys))
+    plt.plot(x, cum_pos, label='TPR cum')
+    plt.plot(x, cum_neg, label='FPR cum')
+    plt.vlines(x[i], cum_neg[i], cum_pos[i], colors='r', linestyles='--', label=f'KS={ks:.3f} @thr~{thr:.3f}')
+    plt.xlabel("Score quantile"); plt.ylabel("Cumulative rate")
+    plt.title("KS Curve"); plt.grid(True, alpha=0.3); plt.legend(loc="best")
+    return _savefig(fig, split, "ks")
+
+def plot_cost_curve(y_true, y_score, split: str, fp_cost: float = 1.0, fn_cost: float = 1.0, steps: int = 200):
+    """
+    임계값 sweep에 따른 비용( FP*cfp + FN*cfn ) 곡선
+    """
+    import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+    yt = _to_np(y_true).astype(int).ravel()
+    ys = _to_np(y_score).astype(float).ravel()
+    taus = np.linspace(0,1,max(10,int(steps)))
+    costs = []
+    for t in taus:
+        yp = (ys >= t).astype(int)
+        fp = int(((yt==0)&(yp==1)).sum())
+        fn = int(((yt==1)&(yp==0)).sum())
+        costs.append(fp*fp_cost + fn*fn_cost)
+    costs = np.asarray(costs)
+    i = int(np.argmin(costs))
+    fig = plt.figure()
+    plt.plot(taus, costs)
+    plt.scatter([taus[i]], [costs[i]], color='r', s=24, label=f"min@τ={taus[i]:.3f}")
+    plt.xlabel("threshold τ"); plt.ylabel("cost")
+    plt.title(f"Cost Curve (cfp={fp_cost}, cfn={fn_cost})")
+    plt.grid(True, alpha=0.3); plt.legend(loc="best")
+    return _savefig(fig, split, "cost_curve")
+
+def plot_lift_gain(y_true, y_score, split: str, steps: int = 20):
+    """
+    Lift & Cumulative Gain chart
+    """
+    import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+    yt = _to_np(y_true).astype(int).ravel()
+    ys = _to_np(y_score).astype(float).ravel()
+    order = np.argsort(-ys)
+    yt = yt[order]
+    n = yt.size
+    steps = max(5,int(steps))
+    ks = np.linspace(1/steps, 1, steps)
+    gains = []
+    lifts = []
+    base = yt.mean() if n>0 else 0.0
+    for k in ks:
+        m = int(np.ceil(n*k))
+        captured = (yt[:m]==1).sum() / max(1,(yt==1).sum())
+        gains.append(captured)
+        lifts.append( (captured / k) if k>0 else np.nan )
+
+    fig = plt.figure(figsize=(7,3.5))
+    import matplotlib.pyplot as plt
+    ax1 = plt.gca()
+    ax1.plot(ks*100, gains, label="Cumulative Gain")
+    ax1.plot([0,100],[0,1],'--',alpha=0.5,label="Baseline")
+    ax1.set_xlabel("Top k%"); ax1.set_ylabel("Captured positive ratio"); ax1.legend(loc="best")
+    ax1.grid(True, alpha=0.3)
+    plt.twinx()
+    plt.plot(ks*100, lifts, color="tab:orange")
+    plt.ylabel("Lift")
+    plt.title("Lift & Cumulative Gain")
+    return _savefig(fig, split, "lift_gain")
+
 # ─────────────────────────── regression ───────────────────────────
 
 def plot_residuals(y_true: np.ndarray, y_pred: np.ndarray, split: str):
@@ -235,6 +344,58 @@ def plot_residuals(y_true: np.ndarray, y_pred: np.ndarray, split: str):
     fig = plt.figure(); plt.hist(resid, bins=50, alpha=0.85); plt.title("Residual Histogram")
     plt.xlabel("pred - true"); plt.ylabel("count"); plt.grid(True, alpha=0.3)
     return _savefig(fig, split, "resid")
+
+def plot_residual_qq(y_true: np.ndarray, y_pred: np.ndarray, split: str):
+    import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+    from scipy.stats import probplot as _pp  # SciPy 없으면 간단히 대체 가능하지만, 여기선 존재 가정X → 자체구현
+    try:
+        fig = plt.figure()
+        yt = _to_np(y_true).astype(float).ravel()
+        yp = _to_np(y_pred).astype(float).ravel()
+        resid = (yp - yt).astype(float)
+        _pp(resid, dist='norm', plot=plt)
+        plt.title("Residual QQ-plot")
+        return _savefig(fig, split, "resid_qq")
+    except Exception:
+        # SciPy 미존재 시 근사 구현
+        yt = _to_np(y_true).astype(float).ravel()
+        yp = _to_np(y_pred).astype(float).ravel()
+        resid = (yp - yt).astype(float)
+        q = np.linspace(0.001,0.999,199)
+        emp = np.quantile(resid, q)
+        # 표준정규 분위수 근사 (역오차함수)
+        from math import sqrt, log
+        def approx_norm_ppf(p):
+            # Abramowitz-Stegun 근사
+            a1=-39.696830; a2=220.946098; a3=-275.928510
+            b1=-54.476098; b2=161.585836; b3=-155.698979
+            c1=0.007784695; c2=0.322467129; c3=2.515517; c4=0.802853; c5=0.010328
+            pl = 0.02425; ph = 1 - pl
+            if p < pl:
+                q = sqrt(-2*log(p))
+                return (((((c1*q + c2)*q + c3)*q + c4)*q + c5) / ((((c1*q + c2)*q + 1)*q) + 1))
+            if p > ph:
+                q = sqrt(-2*log(1-p))
+                return -(((((c1*q + c2)*q + c3)*q + c4)*q + c5) / ((((c1*q + c2)*q + 1)*q) + 1))
+            # 중앙영역 간단 근사
+            return np.sqrt(2)*np.erfinv(2*p-1)
+        theo = np.array([approx_norm_ppf(p) for p in q])
+        import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+        fig = plt.figure(); plt.scatter(theo, emp, s=8, alpha=0.7)
+        plt.plot([theo.min(),theo.max()],[theo.min(),theo.max()],'--',alpha=0.6)
+        plt.xlabel("Theoretical quantiles (N(0,1))"); plt.ylabel("Empirical residual quantiles")
+        plt.title("Residual QQ-plot (approx)")
+        return _savefig(fig, split, "resid_qq")
+
+def plot_residual_time(y_true: np.ndarray, y_pred: np.ndarray, split: str):
+    import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+    yt = _to_np(y_true).astype(float).ravel()
+    yp = _to_np(y_pred).astype(float).ravel()
+    resid = (yp - yt).astype(float)
+    fig = plt.figure(); plt.plot(resid, lw=0.8)
+    plt.xlabel("time (ordered index)"); plt.ylabel("residual"); plt.title("Residual over time")
+    plt.grid(True, alpha=0.3)
+    return _savefig(fig, split, "resid_time")
 
 def plot_pred_vs_true(y_true: np.ndarray, y_pred: np.ndarray, split: str):
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
@@ -247,6 +408,25 @@ def plot_pred_vs_true(y_true: np.ndarray, y_pred: np.ndarray, split: str):
     plt.xlabel("true"); plt.ylabel("pred"); plt.title("Pred vs True"); plt.grid(True, alpha=0.3)
     return _savefig(fig, split, "pred_vs_true")
 
+# ─────────────────────────── performance ───────────────────────────
+
+def plot_latency_bar(latency_dict: dict, split: str):
+    """
+    latency_dict 예: {"b1":4.2, "b64":1.8, "b1024":0.7}
+    """
+    import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+    if not isinstance(latency_dict, dict) or len(latency_dict)==0:
+        # 빈 입력이면 빈 그림이라도 남김
+        fig = plt.figure(); plt.title("Latency (no data)"); return _savefig(fig, split, "latency_bar")
+    keys = list(latency_dict.keys())
+    vals = [latency_dict[k] for k in keys]
+    fig = plt.figure()
+    x = np.arange(len(keys)); plt.bar(x, vals)
+    plt.xticks(x, keys); plt.ylabel("ms"); plt.title("Latency by batch")
+    for i, v in enumerate(vals): plt.text(i, v, f"{v:.2f}", ha='center', va='bottom', fontsize=8)
+    plt.grid(axis='y', alpha=0.3)
+    return _savefig(fig, split, "latency_bar")
+
 # ─────────────────────────── samples ───────────────────────────
 
 def plot_samples(X, y_true=None, y_pred=None, split: str = "val", max_samples: int = 3, ch: int = 0, title: str = "Samples"):
@@ -254,7 +434,7 @@ def plot_samples(X, y_true=None, y_pred=None, split: str = "val", max_samples: i
     X: [N,C,T] 또는 [N,T] (torch.Tensor 또는 np.ndarray)
     y_true: (선택) [N] 또는 [N,T] — 다음 스텝 값 또는 시계열
     y_pred: (선택) [N] 또는 [N,T]
-    저장: plots/after_<split>_samples.png (단일 그림, 최대 max_samples 서브플롯)
+    저장: plots/after_<split>_samples.png
     """
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
     Xn = _to_np(X)
@@ -276,7 +456,7 @@ def plot_samples(X, y_true=None, y_pred=None, split: str = "val", max_samples: i
         ax.set_xlim(0, T-1)
         ax.grid(True, alpha=0.3)
 
-        # 다음 스텝 포인트(스칼라) 표기 — y_true/ y_pred가 1D이면 T 위치에 점으로 표시
+        # 다음 스텝 포인트(스칼라) 표기
         if yt is not None:
             if yt.ndim == 1:
                 ax.scatter([T], [float(yt[i])], marker="o", s=24, label="y_true@T")
@@ -289,7 +469,6 @@ def plot_samples(X, y_true=None, y_pred=None, split: str = "val", max_samples: i
                 ax.plot(np.arange(yp.shape[1]), yp[i], lw=1.0, alpha=0.8, linestyle="--", label="y_pred")
 
         ax.set_title(f"{title} — sample #{int(i)} (ch={ch})")
-
         handles, labels = ax.get_legend_handles_labels()
         if handles:
             ax.legend(loc="best", fontsize=8)

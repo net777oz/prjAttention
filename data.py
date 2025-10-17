@@ -1,42 +1,94 @@
 # -*- coding: utf-8 -*-
 """
 data.py — 데이터 로딩/출력 경로/시드 (다변량 CSV 지원)
-- 변경점:
-  • parse_csv_single: 단일 CSV → [N,1,T] (기존 유지, _in_channels/_label_csv 주입)
-  • parse_csv_list  : 여러 CSV → [N,C,T] (순서 보존, _in_channels/_label_csv 주입)
-  • parse_csv_auto  : 단일/다중 자동 분기
-  • read_csv_no_header: BOM/헤더 1행 자동 처리
+- parse_csv_single : 단일 CSV → [N,1,T]
+- parse_csv_list   : 여러 CSV → [N,C,T] (순서 보존, ch0이 라벨 소스)
+- parse_csv_auto   : 단일/다중 자동 분기
+- read_csv_no_header: BOM/헤더/구분자 자동 처리(, / \t), 빈 줄·주석 무시
 """
-import os, io, numpy as np, torch
+import os
+import io
+import numpy as np
+import torch
 
-def set_seed(seed:int=777):
+# ───────────────────────── common ─────────────────────────
+
+def set_seed(seed: int = 777):
     import torch.backends.cudnn as cudnn
-    np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
-    cudnn.deterministic = True; cudnn.benchmark = False
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    cudnn.deterministic = True
+    cudnn.benchmark = False
 
-def ensure_outdir(p:str): os.makedirs(p, exist_ok=True)
+def ensure_outdir(p: str):
+    os.makedirs(p, exist_ok=True)
 
-def _loadtxt_from_text(text: str) -> np.ndarray:
-    return np.loadtxt(io.StringIO(text), delimiter=",", dtype=np.float32)
+def _normalize_path(p: str) -> str:
+    return os.path.abspath(os.path.expanduser(p))
 
-def read_csv_no_header(path:str) -> np.ndarray:
-    # UTF-8 BOM 제거를 위해 utf-8-sig 로 읽음
+def _loadtxt_from_text(text: str, delimiter: str) -> np.ndarray:
+    return np.loadtxt(io.StringIO(text), delimiter=delimiter, dtype=np.float32)
+
+# ─────────────────────── CSV reader (robust) ───────────────────────
+
+def read_csv_no_header(path: str) -> np.ndarray:
+    """
+    - UTF-8 BOM 허용(utf-8-sig)
+    - CR/LF 정규화
+    - 빈 줄/주석(#...) 제거
+    - 구분자 자동 판별: 콤마 우선, 없으면 탭
+    - 첫 줄이 헤더(문자열)인 경우 1행 드롭 후 재시도
+    반환: np.ndarray [N, T]
+    """
+    path = _normalize_path(path)
     with open(path, "r", encoding="utf-8-sig") as f:
         raw = f.read()
+
+    # 줄 정규화 + 주석/빈 줄 제거
     raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    lines = []
+    for ln in raw.split("\n"):
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        lines.append(s)
+    if not lines:
+        raise SystemExit(f"[data] empty file: {os.path.basename(path)}")
+
+    # 구분자 추정: 콤마가 있으면 콤마, 아니면 탭 시도
+    first = lines[0]
+    delimiter = "," if ("," in first) or ("\t" not in first) else "\t"
+
+    text = "\n".join(lines)
     try:
-        x = _loadtxt_from_text(raw)
+        x = _loadtxt_from_text(text, delimiter=delimiter)
     except ValueError:
-        # 첫 줄에 문자열 헤더가 있을 수 있으니 1행 삭제 후 재시도
-        lines = [ln for ln in raw.split("\n") if ln.strip() != ""]
+        # 첫 줄 헤더 가정 후 1행 드롭
         if len(lines) <= 1:
             raise
-        x = _loadtxt_from_text("\n".join(lines[1:]))
-        print(f"[WARN] dropped header line: {os.path.basename(path)}")
-    return x[None, :] if x.ndim == 1 else x  # [N,T]
+        try:
+            x = _loadtxt_from_text("\n".join(lines[1:]), delimiter=delimiter)
+            print(f"[WARN] dropped header line: {os.path.basename(path)}")
+        except ValueError as e:
+            # 구분자 반대로 최종 재시도
+            alt = "\t" if delimiter == "," else ","
+            try:
+                x = _loadtxt_from_text("\n".join(lines[1:]), delimiter=alt)
+                print(f"[WARN] auto-switched delimiter to {repr(alt)} after header drop: {os.path.basename(path)}")
+            except Exception:
+                raise SystemExit(f"[data] cannot parse CSV: {os.path.basename(path)} ({e})")
+
+    if x.ndim == 1:
+        x = x[None, :]  # [N,T]
+    if x.ndim != 2:
+        raise SystemExit(f"[data] CSV must resolve to 2D [N,T], got {tuple(x.shape)} at {os.path.basename(path)}")
+    return x
 
 def to_tensor(x: np.ndarray) -> torch.Tensor:
-    return torch.from_numpy(x).to(dtype=torch.float32).contiguous()
+    return torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32))
+
+# ─────────────────────── parse (single/list/auto) ───────────────────────
 
 def parse_csv_single(args) -> torch.Tensor:
     """
@@ -45,27 +97,29 @@ def parse_csv_single(args) -> torch.Tensor:
     if not args.csv:
         raise SystemExit("CSV 입력 필요: --csv <path>")
     path = args.csv[0] if isinstance(args.csv, list) else args.csv
+    path = _normalize_path(path)
+
     M = to_tensor(read_csv_no_header(path))  # [N,T]
     if M.ndim != 2:
         raise SystemExit(f"--csv는 2차원 [N,T] 형태여야 합니다. got shape={tuple(M.shape)}")
     X = M.unsqueeze(1)  # [N,1,T]
 
-    # 메타 주입: 채널수/라벨 소스
+    # 메타 주입
     setattr(args, "_in_channels", 1)
     setattr(args, "_label_csv", path)
     print(f"[INFO] parse_csv_single: {path} -> {tuple(X.shape)} (label from first CSV = ch0)")
-
     return X
 
 def parse_csv_list(args) -> torch.Tensor:
     """
     여러 CSV: 각각 [N,T] 를 채널 축(C)으로 스택 → [N,C,T]
-    모든 CSV의 [N,T]가 일치해야 함
+    모든 CSV의 [N,T]가 일치해야 함. 첫 CSV가 라벨 소스(ch0).
     """
-    # 리스트/튜플 등 순서 보존 전제: 첫 항목이 라벨 기준(ch0)
     paths = list(args.csv)
     if len(paths) < 2:
         raise SystemExit("[data] parse_csv_list requires >=2 CSVs")
+
+    paths = [_normalize_path(p) for p in paths]
     mats = [to_tensor(read_csv_no_header(p)) for p in paths]  # 각 [N,T]
     N0, T0 = mats[0].shape
     for p, m in zip(paths, mats):
@@ -88,16 +142,29 @@ def parse_csv_auto(args) -> torch.Tensor:
     """
     if not isinstance(args.csv, list):
         args.csv = [args.csv]
+    # 경로 정규화(로그/메타 일관성)
+    args.csv = [_normalize_path(p) for p in args.csv]
     return parse_csv_single(args) if len(args.csv) == 1 else parse_csv_list(args)
 
-def make_run_dir(args, base:str) -> str:
+# ─────────────────────── run dir ───────────────────────
+
+def make_run_dir(args, base: str) -> str:
+    """
+    out_dir을 확정하고 폴더 생성. plots/도 함께 만든다.
+    - args.out 지정 시 그대로 사용
+    - 그 외에는 규칙 기반 네이밍(원래 규칙 유지)
+    """
     if args.out:
         run_name = args.out
     else:
-        # in_channels는 pipeline에서 세팅한 args._in_channels(없으면 1)
         ch = getattr(args, "_in_channels", 1)
-        slug = f"{args.mode}_{args.task}_ctx{args.context_len}_ch{ch}_alpha{args.alpha:.2f}_pw{args.pos_weight}_{args.backbone}_seed{args.seed}_split{args.split_mode}"
-        run_name = slug
+        run_name = (
+            f"{args.mode}_{args.task}_ctx{args.context_len}_ch{ch}_"
+            f"alpha{args.alpha:.2f}_pw{args.pos_weight}_{args.backbone}_"
+            f"seed{args.seed}_split{args.split_mode}"
+        )
+    base = _normalize_path(base)
     out_dir = os.path.join(base, run_name)
-    ensure_outdir(out_dir); ensure_outdir(os.path.join(out_dir, "plots"))
+    ensure_outdir(out_dir)
+    ensure_outdir(os.path.join(out_dir, "plots"))
     return out_dir
