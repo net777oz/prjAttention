@@ -3,7 +3,7 @@
 evaler.py — 회귀/분류 공용 OOM-안전 평가 (이미지 비생성)
 - 저장: "런 폴더 루트(AP_OUT_DIR)" 바로 아래에만 JSON/CSV 저장
   * 분류:  <run>/metrics.json, <run>/preds.csv
-  * 회귀:  <run>/summary.json
+  * 회귀:  <run>/summary.json + <run>/pred.csv(혹은 <split>_pred.csv)
 - 그림은 만들지 않음 (viz.py가 plots/after_<split>_*.png 한 군데만 생성)
 
 저장 시점 정책:
@@ -70,7 +70,7 @@ def _bin_metrics(y, yhat):
     fp=float(np.sum((y==0)&(yhat==1))); fn=float(np.sum((y==1)&(yhat==0)))
     prec=tp/(tp+fp) if (tp+fp)>0 else 0.0; rec=tp/(tp+fn) if (tp+fn)>0 else 0.0
     f1=(2*prec*rec)/(prec+rec) if (prec+rec)>0 else 0.0; acc=(tp+tn)/max(1.0,tp+tn+fp+fn)
-    return dict(tp=tp,tn=tn,fp=fp,fn=fn,precision=prec,recall=rec,f1=f1,accuracy=acc)
+    return dict(tp=tp,tn=tn,fp=fp,fn=fn,precision=prec,rec=rec,f1=f1,accuracy=acc)
 
 def _best_threshold(y, p, strategy="f1"):
     ths=np.linspace(0,1,1001); best=(-1,0.5,{})
@@ -79,7 +79,30 @@ def _best_threshold(y, p, strategy="f1"):
         if v>best[0]: best=(v,float(t),m)
     return best[1], best[2]
 
-# ─────────────────────────── 저장 루틴 (이미지 없음) ───────────────────────────
+# ─────────────────────────── CSV 저장 유틸 ───────────────────────────
+
+def _resolve_reg_pred_fname(desc: str, split_name: Optional[str]) -> str:
+    """회귀 예측 CSV 파일명 규칙:
+       - desc/split_name에 'infer'가 포함되면 → pred.csv
+       - 그 외에는 <tag>_pred.csv  (예: split_name='val', desc='after' → val_pred.csv)
+    """
+    tag = (split_name or desc or "eval").lower()
+    if "infer" in tag:
+        return "pred.csv"
+    return f"{tag}_pred.csv"
+
+def _save_reg_preds_csv(run_root: Path, fname: str, y_true: np.ndarray, y_pred: np.ndarray):
+    """회귀 예측 CSV 저장: 컬럼 [index, y_true, y_pred]"""
+    import csv
+    path = run_root / fname
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["index", "y_true", "y_pred"])
+        for i, (yt, yp) in enumerate(zip(y_true, y_pred)):
+            w.writerow([int(i), float(yt), float(yp)])
+    print(f"[INFO] regress predictions saved: {path}")
+
+# ─────────────────────────── 분류 저장 유틸 (기존) ───────────────────────────
 
 def _save_preds_csv(run_root: Path, y_true: np.ndarray, y_score: np.ndarray, tau_default: float):
     try:
@@ -139,6 +162,9 @@ def eval_model(model,
     mse_list, mae_list = [], []
     prob_buf, true_buf = [], []
 
+    # NEW: 회귀 예측/정답 버퍼 (CSV 저장용)
+    reg_true_buf, reg_pred_buf = [], []
+
     # 콘솔 표시에만 사용(저장 경로엔 영향 없음)
     tag = str(split_name if split_name else desc)
 
@@ -167,6 +193,8 @@ def eval_model(model,
                     Yw=_sel_ch0(Yw_reg).to(dev,non_blocking=True); pred,_=model(Xw); pred=_sel_ch0(pred)
                     assert pred.shape==Yw.shape
                     mse_list.append(F.mse_loss(pred,Yw).item()); mae_list.append(F.l1_loss(pred,Yw).item())
+                    # NEW: 버퍼에 저장 (CPU)
+                    reg_true_buf.append(Yw.detach().cpu()); reg_pred_buf.append(pred.detach().cpu())
                     metric_val=float(np.mean(mse_list)) if mse_list else float("nan")
                 else:
                     Yw_sel=_sel_ch0(Yw_reg).to(dev,non_blocking=True); Yb=binarize(Yw_sel)
@@ -193,6 +221,8 @@ def eval_model(model,
                 Yw=_sel_ch0(Yw_reg).to(dev,non_blocking=True); pred,_=model(Xw); pred=_sel_ch0(pred)
                 assert pred.shape==Yw.shape
                 mse_list.append(F.mse_loss(pred,Yw).item()); mae_list.append(F.l1_loss(pred,Yw).item())
+                # NEW: 버퍼에 저장 (CPU)
+                reg_true_buf.append(Yw.detach().cpu()); reg_pred_buf.append(pred.detach().cpu())
             else:
                 Yw_sel=_sel_ch0(Yw_reg).to(dev,non_blocking=True); Yb=binarize(Yw_sel)
                 logits,_=model(Xw); logits=_sel_ch0(logits); probs=torch.sigmoid(logits)
@@ -207,8 +237,19 @@ def eval_model(model,
         avg_mse=float(np.mean(mse_list)) if mse_list else float("nan")
         avg_mae=float(np.mean(mae_list)) if mae_list else float("nan")
         if save_allowed:
-            try: _write_summary_json_reg(run_root, mse_list, mae_list)
-            except Exception as e: print(f"[WARN] 회귀 요약 저장 실패: {e}")
+            try:
+                # 1) 요약 저장
+                _write_summary_json_reg(run_root, mse_list, mae_list)
+                # 2) 예측 CSV 저장 (버퍼가 채워진 경우)
+                if reg_true_buf and reg_pred_buf:
+                    yt = torch.cat(reg_true_buf, dim=0).view(-1).cpu().numpy()
+                    yp = torch.cat(reg_pred_buf, dim=0).view(-1).cpu().numpy()
+                    fname = _resolve_reg_pred_fname(desc=str(desc), split_name=split_name)
+                    _save_reg_preds_csv(run_root, fname, yt, yp)
+                else:
+                    print("[WARN] (regress) 예측/정답 버퍼가 비어 있어 pred CSV 저장을 건너뜁니다.")
+            except Exception as e:
+                print(f"[WARN] 회귀 결과 저장 실패: {e}")
         else:
             print("[INFO] (evaler) SAVE SKIPPED (regress) — BEFORE/검증 중간단계이거나 정책상 저장 안 함")
         return (avg_mse, avg_mae, None, None)

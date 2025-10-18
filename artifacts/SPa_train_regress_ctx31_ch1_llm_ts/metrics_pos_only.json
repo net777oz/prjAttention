@@ -1,0 +1,19 @@
+{
+  "n":78223,
+  "threshold":-1.0,
+  "mae_pos":0.0094024686,
+  "rmse_pos":0.0642263391,
+  "r2_pos":0.1270486542,
+  "y_true_mean_pos":0.0041803562,
+  "y_pred_mean_pos":0.0065233754,
+  "hist_rule":"auto",
+  "hist_range":[
+    0.0000008007,
+    0.13828976
+  ],
+  "low_pct":0.5,
+  "high_pct":99.5,
+  "ts_mode":"overlay",
+  "scatter_mode":"size",
+  "ts_y2_fixed_02":false
+}
