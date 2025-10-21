@@ -165,6 +165,6 @@ def make_run_dir(args, base: str) -> str:
         )
     base = _normalize_path(base)
     out_dir = os.path.join(base, run_name)
-    ensure_outdir(out_dir)
-    ensure_outdir(os.path.join(out_dir, "plots"))
+    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(os.path.join(out_dir, "plots"), exist_ok=True)
     return out_dir

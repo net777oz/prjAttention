@@ -9,6 +9,7 @@ pipeline.py — Train / Finetune / Infer 오케스트레이션 (다변량 입력
   • (신규) out_dir 확정 직후 AP_OUT_DIR를 내부적으로 고정 → viz/evaler가 동일 런 폴더만 사용
   • (신규) plot_samples 호출을 viz.py 현재 시그니처로 교체
   • (신규) 리포트용 산출물 저장: manifest.json / (classify) metrics.json+preds.csv / (regress) summary.json
+  • (신규) 옵션/ENV로 라벨 소스 채널을 입력 특징에서 제외(drop)하고 라벨로만 사용
 """
 import os, time, json, csv
 import torch
@@ -53,6 +54,9 @@ def _save_ckpt(model, args, out_path: str):
         "seed": args.seed,
         "torch": torch.__version__,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        # 신규 기록(재현성): 라벨 소스/드롭 정보
+        "label_src_ch": int(getattr(args, "_label_src_ch", 0)),
+        "dropped_channels": list(getattr(args, "_dropped_channels", [])),
     }
     torch.save({"state_dict": sd_clean, "meta": meta}, out_path)
     print(f"[DONE] saved checkpoint to {out_path}", flush=True)
@@ -136,6 +140,8 @@ def _rows_from_indices(groups: torch.Tensor, idx_list: List[int]) -> List[int]:
 
 # ──────────────────────── report helpers ─────────────────────────
 
+import json as _json_for_helper  # shadow guard
+
 def _write_json(path, obj):
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -178,7 +184,9 @@ def _save_manifest(out_dir, args, N, C, T, train_w, val_w, device, amp_available
         "amp": bool(amp_available),
         "compile": compiled_mode if compiled_mode else "OFF",
         "model_size": {"params": int(n_params)},
-        "data": {"N": int(N), "C": int(C), "T": int(T), "train_windows": int(train_w), "val_windows": int(val_w)},
+        "data": {"N": int(N), "C_original": int(C), "T": int(T), "train_windows": int(train_w), "val_windows": int(val_w)},
+        "label_src_ch": int(getattr(args, "_label_src_ch", 0)),
+        "dropped_channels": list(getattr(args, "_dropped_channels", [])),
     }
     _write_json(os.path.join(out_dir, "manifest.json"), man)
 
@@ -189,19 +197,40 @@ def main_run(args):
     # 데이터: 단일/다중 자동
     X = parse_csv_auto(args)            # [N,1,T] 또는 [N,C,T]
     N, C, T = X.shape
-    args._in_channels = int(C)          # ← 채널 수를 args에 기록(메타/출력 이름 반영)
+
+    # ---------- 신규: 라벨소스/드롭 플래그 수집 (CLI > ENV > default) ----------
+    drop_label_from_x = bool(getattr(args, "drop_label_from_x", False) or (os.environ.get("AP_DROP_LABEL_FROM_X", "0") == "1"))
+    label_src_ch = int(getattr(args, "label_src_ch", os.environ.get("AP_LABEL_SRC_CH", "0")))
+    if label_src_ch < 0 or label_src_ch >= C:
+        print(f"[WARN] label_src_ch({label_src_ch}) out of range for C={C} → clamp to 0", flush=True)
+        label_src_ch = 0
+    dropped = set([label_src_ch]) if drop_label_from_x else set()
+
+    # 모델 입력 채널 수 계산(라벨 채널 제외 여부 반영)
+    C_eff = C - (1 if drop_label_from_x else 0)
+    if C_eff <= 0:
+        raise SystemExit(f"[data] Effective input channels becomes 0 (C={C}, drop_label_from_x={drop_label_from_x}). Need at least one non-label feature.")
+
+    # 메타/ENV 주입(윈도우/평가 경로 공통 적용)
+    args._in_channels = int(C_eff)
+    args._label_src_ch = int(label_src_ch)
+    args._dropped_channels = sorted(list(dropped))
+    os.environ.setdefault("AP_OUT_DIR", "")  # 아래에서 재설정
+    os.environ["AP_LABEL_SRC_CH"] = str(label_src_ch)
+    os.environ["AP_DROP_LABEL_FROM_X"] = "1" if drop_label_from_x else "0"
+
     _maybe_fix_context_len(args, T)
 
     out_dir = make_run_dir(args, DEFAULT_BASE_OUT)
 
     # ★★★ 핵심: 자동 런 폴더를 내부 공유(사용자 export 불필요)
-    os.environ.setdefault("AP_OUT_DIR", str(out_dir))
+    os.environ["AP_OUT_DIR"] = str(out_dir)
 
     # AMP 실제 가용성
     amp_available = bool(args.amp and torch.cuda.is_available() and str(args.device).startswith("cuda"))
 
-    # 1) 모델 생성 (compile 전)
-    model, _ = load_model_and_cfg(backbone=args.backbone, in_channels=int(C))  # ← C 반영
+    # 1) 모델 생성 (compile 전) — 입력 채널은 C_eff 사용
+    model, _ = load_model_and_cfg(backbone=args.backbone, in_channels=int(C_eff))
     model = model.to(device=args.device, dtype=torch.float32)
     compiled_mode = None
 
@@ -214,7 +243,8 @@ def main_run(args):
     print(
         f"[INFO] start | mode={args.mode}, task={args.task}, split={args.split_mode}, "
         f"backbone={args.backbone}, "
-        f"N={N},C={C},T={T},context={args.context_len},params={sum(p.numel() for p in model.parameters())}",
+        f"N={N},C={C}(eff={C_eff}),T={T},context={args.context_len},params={sum(p.numel() for p in model.parameters())}, "
+        f"label_src_ch={label_src_ch}, drop_label_from_x={drop_label_from_x}",
         flush=True,
     )
 
@@ -225,7 +255,9 @@ def main_run(args):
     # 3) compile 적용(필요 시)
     model, compiled_mode = _maybe_compile(model, args)
 
-    # ---- 공통 전처리: 윈도우/스플릿 준비 (BEFORE/AFTER에서 동일 사용) ----
+    # ---- 공통 전처리: 윈도우/스플릿 준비
+    #   windows.build_windows_dataset는 ENV(AP_DROP_LABEL_FROM_X/AP_LABEL_SRC_CH)를 읽어
+    #   라벨(ch=label_src_ch)만 유지하고, 입력 채널에서는 필요 시 제외 처리합니다.
     Xw_all, Yw_next, groups, W = build_windows_dataset(X, args.context_len)
     if args.task == "regress":
         Yw_all = Yw_next

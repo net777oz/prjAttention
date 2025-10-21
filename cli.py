@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 cli.py — 명령행 인터페이스 (다변량 CSV 지원)
-- 변경점:
-  • --csv 를 단일/다중 경로 모두 수용(nargs='+')
-  • 평가/플롯 스플릿 제어 플래그 추가 (--eval-split, --plot-split)
-  • 나머지 인자/기본값/흐름은 동일
+- --csv 단일/다중 경로 수용(nargs='+')
+- 평가/플롯 스플릿 제어 (--eval-split, --plot-split)
+- (선택) 라벨 채널 입력 제외 옵션 (--drop-label-from-x, --label-src-ch)
 [의존] pipeline.main_run
-[제공] main()
 """
+
 import argparse
 import torch
 from pipeline import main_run
@@ -15,10 +14,11 @@ from pipeline import main_run
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
+
     # 입력
     ap.add_argument(
         "--csv", type=str, nargs="+", required=True,
-        help="하나 이상의 CSV 경로 (헤더/인덱스 없음, [N,T]). 여러 개 주면 다변량(C채널)로 처리"
+        help="하나 이상의 CSV 경로 ([N,T]). 여러 개면 채널 축으로 스택"
     )
 
     # 모드/작업/모델/학습/출력
@@ -56,21 +56,18 @@ def build_parser() -> argparse.ArgumentParser:
     # 체크포인트
     ap.add_argument("--ckpt", type=str, default=None)
 
-    # (신규) 평가/플롯 시 사용할 스플릿 지정: 기본 'val'로 안전 고정
-    ap.add_argument(
-        "--eval-split", type=str, default="val",
-        choices=["val", "train", "all"],
-        help="평가(eval_model) 시 사용할 스플릿 선택 (기본: val)"
-    )
-    ap.add_argument(
-        "--plot-split", type=str, default="val",
-        choices=["val", "train", "all"],
-        help="플롯(plot_samples/plot_cls_curves) 시 사용할 스플릿 선택 (기본: val)"
-    )
-    ap.add_argument(
-        "--no-plots", action="store_true",
-        help="플롯 생성 비활성화"
-    )
+    # 평가/플롯 스플릿
+    ap.add_argument("--eval-split", type=str, default="val", choices=["val", "train", "all"],
+                    help="평가(eval_model) 시 사용할 스플릿 (기본: val)")
+    ap.add_argument("--plot-split", type=str, default="val", choices=["val", "train", "all"],
+                    help="플롯(plot_samples/plot_cls_curves) 시 사용할 스플릿 (기본: val)")
+    ap.add_argument("--no-plots", action="store_true", help="플롯 생성 비활성화")
+
+    # (선택) 라벨 채널을 입력에서 제외
+    ap.add_argument("--drop-label-from-x", action="store_true",
+                    help="켜면 label_src_ch 채널을 입력 X에서 제외하고 라벨로만 사용")
+    ap.add_argument("--label-src-ch", type=int, default=0,
+                    help="라벨 소스 채널 인덱스 (기본 0; 보통 ch0=rul.csv)")
 
     return ap
 
@@ -78,7 +75,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main():
     ap = build_parser()
     args = ap.parse_args()
-    # 항상 list 로 통일
     if isinstance(args.csv, str):
         args.csv = [args.csv]
     main_run(args)
