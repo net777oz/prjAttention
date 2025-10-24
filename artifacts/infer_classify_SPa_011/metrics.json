@@ -1,5 +1,5 @@
 {
-  "generated_at": "2025-10-25 13:55:04",
+  "generated_at": "2025-10-25 01:27:31",
   "counts": {
     "n": 2185,
     "pos": 30,
@@ -9,13 +9,13 @@
   "threshold_default": 0.5,
   "metrics_at_default": {
     "threshold": 0.5,
-    "precision": 0.19166666666666668,
+    "precision": 0.1885245901639344,
     "recall": 0.7666666666666667,
-    "f1": 0.3066666666666667,
-    "accuracy": 0.9524027459954233,
+    "f1": 0.30263157894736836,
+    "accuracy": 0.951487414187643,
     "tp": 23,
-    "tn": 2058,
-    "fp": 97,
+    "tn": 2056,
+    "fp": 99,
     "fn": 7
   },
   "threshold_best": null,

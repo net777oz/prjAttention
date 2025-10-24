@@ -1,0 +1,25 @@
+{
+  "generated_at": "2025-10-25 01:29:17",
+  "counts": {
+    "n": 2185,
+    "pos": 0,
+    "neg": 2185
+  },
+  "prevalence": 0.0,
+  "threshold_default": 0.5,
+  "metrics_at_default": {
+    "threshold": 0.5,
+    "precision": 0.0,
+    "recall": 0.0,
+    "f1": 0.0,
+    "accuracy": 1.0,
+    "tp": 0,
+    "tn": 2185,
+    "fp": 0,
+    "fn": 0
+  },
+  "threshold_best": null,
+  "metrics_at_best": {},
+  "roc_auc": NaN,
+  "pr_auc": NaN
+}
