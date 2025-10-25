@@ -1,0 +1,35 @@
+{
+  "generated_at": "2025-10-25 13:47:47",
+  "counts": {
+    "n": 437,
+    "pos": 10,
+    "neg": 427
+  },
+  "prevalence": 0.022883296012878418,
+  "threshold_default": 0.5,
+  "metrics_at_default": {
+    "threshold": 0.5,
+    "precision": 0.18181818181818182,
+    "recall": 0.8,
+    "f1": 0.2962962962962963,
+    "accuracy": 0.9130434782608695,
+    "tp": 8,
+    "tn": 391,
+    "fp": 36,
+    "fn": 2
+  },
+  "threshold_best": 0.9490000605583191,
+  "metrics_at_best": {
+    "threshold": 0.9490000605583191,
+    "precision": 0.42857142857142855,
+    "recall": 0.6,
+    "f1": 0.5,
+    "accuracy": 0.9725400457665904,
+    "tp": 6,
+    "tn": 419,
+    "fp": 8,
+    "fn": 4
+  },
+  "roc_auc": 0.87903981264637,
+  "pr_auc": 0.5180630801311579
+}

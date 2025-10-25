@@ -1,0 +1,25 @@
+{
+  "generated_at": "2025-10-25 13:54:27",
+  "counts": {
+    "n": 2185,
+    "pos": 38,
+    "neg": 2147
+  },
+  "prevalence": 0.017391303554177284,
+  "threshold_default": 0.5,
+  "metrics_at_default": {
+    "threshold": 0.5,
+    "precision": 0.09615384615384616,
+    "recall": 0.6578947368421053,
+    "f1": 0.1677852348993289,
+    "accuracy": 0.8864988558352402,
+    "tp": 25,
+    "tn": 1912,
+    "fp": 235,
+    "fn": 13
+  },
+  "threshold_best": null,
+  "metrics_at_best": {},
+  "roc_auc": 0.7945419557276983,
+  "pr_auc": 0.23815755673778302
+}
