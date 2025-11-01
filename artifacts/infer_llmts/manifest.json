@@ -1,0 +1,24 @@
+{
+  "generated_at": "2025-11-01 04:23:00",
+  "backbone": "llm_ts",
+  "task": "classify",
+  "context_len": 3,
+  "in_channels": 1,
+  "split_mode": "group",
+  "seed": 777,
+  "device": "cuda",
+  "amp": true,
+  "compile": "reduce-overhead",
+  "model_size": {
+    "params": 4739841
+  },
+  "data": {
+    "N": 2642,
+    "C_original": 1,
+    "T": 4,
+    "train_windows": 2113,
+    "val_windows": 529
+  },
+  "label_src_ch": 0,
+  "dropped_channels": []
+}
