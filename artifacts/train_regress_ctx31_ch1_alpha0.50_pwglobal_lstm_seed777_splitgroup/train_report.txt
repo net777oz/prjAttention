@@ -1,0 +1,2 @@
+before(val) MSE 0.006268 MAE 0.039030
+after (val) MSE 0.004121 MAE 0.008811
